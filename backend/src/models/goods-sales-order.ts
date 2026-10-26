@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid";
 import * as db from "../dynamodb.js";
+import { fyTag, nextInSeries } from "../lib/doc-series.js";
 import { PaymentTermsType, DispatchCondition, DueBasis, normalizePaymentTermsType, normalizeAdvancePct, normalizeBalancePct, normalizeBalanceDueDays, normalizeDueBasis, normalizeDispatchCondition, balancePctFor } from "../lib/payment-terms.js";
 
 /**
@@ -79,6 +80,10 @@ export interface GoodsSalesOrder {
   contactPerson: string | null;
   billingAddress: string | null;
   deliveryAddress: string | null;
+  /** Delivery state — standardized Indian State/UT name picked from a dropdown. */
+  state: string | null;
+  /** Delivery city — dependent on the state, picked from a dropdown. */
+  city: string | null;
   // ── PDF header meta (Tally-style print): all optional, blank renders blank. ──
   /** Buyer's purchase-order number printed on the PDF. */
   buyerOrderNo: string | null;
@@ -293,8 +298,9 @@ export function computeTotals(lines: GoodsSalesOrderLine[], freight: number) {
 // `null` = use catalogue rate.
 export const GST_BY_CUSTOMER_TYPE: Record<string, number | null> = {
   Dealer: null,
+  Distributor: null,
   Retailer: null,
-  Defence: null,
+  Defence: 0, // Defence supplies: exempt / 0% concessional GST
   Others: null,
 };
 
@@ -310,13 +316,42 @@ export function gstRateFor(customerType: string | null, catalogueRate: number | 
 }
 
 /**
- * Next buyer order number from previous CONFIRMED orders: takes the highest
- * trailing number (e.g. BO-2026-0042 → 42) and returns BO-<year>-<n+1>.
- * Falls back to BO-<year>-0001 when no confirmed order carries one.
+ * Next buyer order number.
+ *
+ * With a customerId: per-customer sequence — the first order for a customer
+ * is "001", then "002", … Existing trailing-digit formats are honoured
+ * (e.g. BO-2026-0042 → BO-2026-0043, preserving prefix + width). Drafts count
+ * so two open drafts never suggest the same number; cancelled orders don't.
+ *
+ * Without a customerId (legacy): global BO-<year>-<n> sequence from previous
+ * CONFIRMED orders, falling back to BO-<year>-0001.
  */
-export async function nextBuyerOrderNo(clientId: string): Promise<string> {
+export async function nextBuyerOrderNo(clientId: string, customerId?: string | null): Promise<string> {
   const year = new Date().getFullYear();
   const orders = await list(clientId);
+  if (customerId) {
+    const mine = orders.filter(
+      (o) => (o.customerId ?? "") === customerId && (o.status ?? "") !== "cancelled",
+    );
+    let max = 0;
+    let prefix = "";
+    let width = 3;
+    for (const o of mine) {
+      const raw = String(o.buyerOrderNo ?? "").trim();
+      const m = raw.match(/^(.*?)(\d+)\s*$/);
+      if (!m) continue;
+      const n = parseInt(m[2], 10) || 0;
+      if (n > max) {
+        max = n;
+        prefix = m[1];
+        width = Math.max(3, m[2].length);
+      }
+    }
+    if (max === 0 && mine.every((o) => !String(o.buyerOrderNo ?? "").trim())) {
+      return "001";
+    }
+    return `${prefix}${String(max + 1).padStart(width, "0")}`;
+  }
   let max = 0;
   for (const o of orders) {
     if (o.status === "cancelled" || o.status === "draft") continue;
@@ -324,6 +359,17 @@ export async function nextBuyerOrderNo(clientId: string): Promise<string> {
     if (m) max = Math.max(max, parseInt(m[1], 10) || 0);
   }
   return `BO-${year}-${String(max + 1).padStart(4, "0")}`;
+}
+
+/**
+ * Next SO number in the ADV-<FY>-SO- series (e.g. ADV-26/27-SO-001, then
+ * 002, …). Each financial year restarts at 001; every FY keeps its own
+ * running sequence.
+ */
+export async function nextSoNumber(clientId: string, orderDate?: string | null): Promise<string> {
+  const prefix = `ADV-${fyTag(orderDate)}-SO-`;
+  const orders = await list(clientId);
+  return nextInSeries(prefix, orders.map((o) => o.soNumber));
 }
 
 export function recomputeStatus(
@@ -379,7 +425,7 @@ export async function create(
     entityType: "GoodsSalesOrder",
     id,
     clientId: data.clientId,
-    soNumber: data.soNumber || `SO-${id.slice(0, 8).toUpperCase()}`,
+    soNumber: data.soNumber || (await nextSoNumber(data.clientId, data.orderDate || null)),
     orderDate: data.orderDate || db.todayDate(),
     customerId: data.customerId || null,
     customerName: data.customerName || null,
@@ -389,6 +435,8 @@ export async function create(
     contactPerson: data.contactPerson || null,
     billingAddress: data.billingAddress || null,
     deliveryAddress: data.deliveryAddress || null,
+    state: data.state || null,
+    city: data.city || null,
     buyerOrderNo: data.buyerOrderNo || null,
     referenceNo: data.referenceNo || null,
     deliveryNote: data.deliveryNote || null,
@@ -465,6 +513,8 @@ export async function update(id: string, updates: Partial<GoodsSalesOrder>) {
     "contactPerson",
     "billingAddress",
     "deliveryAddress",
+    "state",
+    "city",
     "buyerOrderNo",
     "referenceNo",
     "deliveryNote",

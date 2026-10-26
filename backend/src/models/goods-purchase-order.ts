@@ -1,5 +1,6 @@
 import { v4 as uuid } from "uuid";
 import * as db from "../dynamodb.js";
+import { fyTag, nextInSeries } from "../lib/doc-series.js";
 import { PaymentTermsType, normalizePaymentTermsType, normalizeAdvancePct } from "../lib/payment-terms.js";
 
 /**
@@ -218,6 +219,17 @@ export function computeTotals(lines: GoodsPOLine[], freight: number) {
   };
 }
 
+/**
+ * Next PO number in the ADV-<FY>-PO- series (e.g. ADV-26/27-PO-001, then
+ * 002, …). Each financial year restarts at 001; every FY keeps its own
+ * running sequence.
+ */
+export async function nextPoNumber(clientId: string, poDate?: string | null): Promise<string> {
+  const prefix = `ADV-${fyTag(poDate)}-PO-`;
+  const orders = await list(clientId);
+  return nextInSeries(prefix, orders.map((o) => o.poNumber));
+}
+
 export function recomputeStatus(
   po: Pick<GoodsPurchaseOrder, "status" | "manualStatus" | "lines">,
 ): string {
@@ -269,7 +281,7 @@ export async function create(
     entityType: "GoodsPurchaseOrder",
     id,
     clientId: data.clientId,
-    poNumber: data.poNumber || `PO-${id.slice(0, 8).toUpperCase()}`,
+    poNumber: data.poNumber || (await nextPoNumber(data.clientId, data.poDate || null)),
     poDate: data.poDate || db.todayDate(),
     supplierId: data.supplierId || null,
     supplierName: data.supplierName || null,
@@ -448,9 +460,12 @@ export async function recordReceipt(
     throw new Error("Approve and send the PO before receiving goods");
   if (po.status === "fully_received")
     throw new Error("PO is already fully received");
+  // Sum every matching entry — a GRN may carry the same product on two lines.
   const lines = (po.lines ?? []).map((l) => {
-    const r = received.find((x) => x.productId === l.productId);
-    return r ? { ...l, receivedQty: (l.receivedQty ?? 0) + r.receivedQty } : l;
+    const rs = received.filter((x) => x.productId === l.productId);
+    if (rs.length === 0) return l;
+    const add = rs.reduce((s, x) => s + (Number(x.receivedQty) || 0), 0);
+    return { ...l, receivedQty: (l.receivedQty ?? 0) + add };
   });
   return update(poId, { lines, status: recomputeStatus({ ...po, lines }) });
 }
@@ -463,10 +478,10 @@ export async function revokeReceipt(
   const po = await get(poId);
   if (!po) throw new Error("PO not found");
   const lines = (po.lines ?? []).map((l) => {
-    const r = revoked.find((x) => x.productId === l.productId);
-    return r
-      ? { ...l, receivedQty: Math.max(0, (l.receivedQty ?? 0) - r.receivedQty) }
-      : l;
+    const rs = revoked.filter((x) => x.productId === l.productId);
+    if (rs.length === 0) return l;
+    const sub = rs.reduce((s, x) => s + (Number(x.receivedQty) || 0), 0);
+    return { ...l, receivedQty: Math.max(0, (l.receivedQty ?? 0) - sub) };
   });
   return update(poId, { lines, status: recomputeStatus({ ...po, lines }) });
 }

@@ -25,6 +25,8 @@ import { Plus, Loader2, Save, Trash2, X, Truck } from "lucide-react";
 import { CascadeDeleteDialog, summarizeDeleted } from "@/components/cascade-delete-dialog";
 import { TableSkeleton } from "@/components/skeletons";
 import { useFormDraft, DraftResumeBanner } from "@/lib/form-draft";
+import { StateSelect, CitySelect } from "@/components/state-city-select";
+import { resolveStandardState, stateForCity } from "@/lib/india-city-state";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/app/suppliers")({
@@ -52,10 +54,16 @@ type Supplier = {
   industry: string | null;
   address_line: string | null;
   city: string | null;
+  state_code?: string | null;
   country: string | null;
   postal_code: string | null;
   gstin: string | null;
   pan_card_no: string | null;
+  bank_holder?: string | null;
+  bank_name?: string | null;
+  bank_ac_no?: string | null;
+  bank_ifsc?: string | null;
+  bank_branch?: string | null;
   status: SupplierStatus;
   notes: string | null;
   created_at: string;
@@ -69,10 +77,16 @@ const emptyForm = {
   industry: "",
   address_line: "",
   city: "",
+  state_code: "",
   country: "",
   postal_code: "",
   gstin: "",
   pan_card_no: "",
+  bank_holder: "",
+  bank_name: "",
+  bank_ac_no: "",
+  bank_ifsc: "",
+  bank_branch: "",
   status: "prospect" as SupplierStatus,
   ...toTermsFormFields(null),
   notes: "",
@@ -128,10 +142,16 @@ export function SuppliersPage() {
         industry: form.industry || null,
         address_line: form.address_line || null,
         city: form.city || null,
+        stateCode: resolveStandardState(form.state_code) ?? (form.state_code || null),
         country: form.country || null,
         postal_code: form.postal_code || null,
         gstin: form.gstin || null,
         panCardNo: form.pan_card_no || null,
+        bank_holder: form.bank_holder || null,
+        bank_name: form.bank_name || null,
+        bank_ac_no: form.bank_ac_no || null,
+        bank_ifsc: form.bank_ifsc || null,
+        bank_branch: form.bank_branch || null,
         status: form.status,
         ...termsPayload,
         notes: form.notes || null,
@@ -213,6 +233,12 @@ export function SuppliersPage() {
 
   const openEdit = (s: Supplier) => {
     setEditing(s);
+    const rawState = (s as any).stateCode ?? (s as any).state_code ?? "";
+    const canonical =
+      resolveStandardState(rawState) ??
+      resolveStandardState(s.country ?? "") ??
+      stateForCity(s.city ?? "") ??
+      rawState;
     setForm({
       company_name: s.company_name,
       contact_name: s.contact_name ?? "",
@@ -221,10 +247,16 @@ export function SuppliersPage() {
       industry: s.industry ?? "",
       address_line: s.address_line ?? "",
       city: s.city ?? "",
+      state_code: canonical ?? "",
       country: s.country ?? "",
       postal_code: s.postal_code ?? "",
       gstin: (s as any).gstin ?? "",
       pan_card_no: (s as any).panCardNo ?? (s as any).pan_card_no ?? "",
+      bank_holder: (s as any).bankHolder ?? (s as any).bank_holder ?? "",
+      bank_name: (s as any).bankName ?? (s as any).bank_name ?? "",
+      bank_ac_no: (s as any).bankAcNo ?? (s as any).bank_ac_no ?? "",
+      bank_ifsc: (s as any).bankIfsc ?? (s as any).bank_ifsc ?? "",
+      bank_branch: (s as any).bankBranch ?? (s as any).bank_branch ?? "",
       status: s.status,
       ...toTermsFormFields(s),
       notes: s.notes ?? "",
@@ -307,9 +339,9 @@ export function SuppliersPage() {
                         <td className="px-3 py-3">
                           <div className="font-medium">{s.company_name}</div>
                           <div className="text-xs text-muted-foreground">{s.industry ?? "—"}</div>
-                          {(s.city || s.country) && (
+                          {(s.city || (s as any).state_code || (s as any).stateCode || s.country) && (
                             <div className="text-xs text-muted-foreground/70">
-                              {[s.city, s.country].filter(Boolean).join(", ")}
+                              {[s.city, (s as any).state_code ?? (s as any).stateCode, s.country].filter(Boolean).join(", ")}
                             </div>
                           )}
                         </td>
@@ -427,18 +459,32 @@ export function SuppliersPage() {
                   onChange={(e) => setForm({ ...form, address_line: e.target.value })}
                 />
               </F>
+              <F label="State">
+                <StateSelect
+                  value={form.state_code}
+                  onChange={(v) =>
+                    setForm((prev) => ({
+                      ...prev,
+                      state_code: v,
+                      city: v === prev.state_code ? prev.city : "",
+                    }))
+                  }
+                  placeholder="Select state…"
+                />
+              </F>
               <F label="City">
-                <input
-                  maxLength={100}
-                  className={inputBase}
+                <CitySelect
+                  stateValue={form.state_code}
                   value={form.city}
-                  onChange={(e) => setForm({ ...form, city: e.target.value })}
+                  onChange={(v) => setForm({ ...form, city: v })}
+                  placeholder={form.state_code ? "Select city…" : "Select a state first…"}
                 />
               </F>
               <F label="Country">
                 <input
                   maxLength={100}
                   className={inputBase}
+                  placeholder="e.g. India"
                   value={form.country}
                   onChange={(e) => setForm({ ...form, country: e.target.value })}
                 />
@@ -512,6 +558,48 @@ export function SuppliersPage() {
                   onChange={(patch) => setForm({ ...form, ...patch })}
                 />
               </F>
+              <div className="md:col-span-2 mt-1 border-t border-border/60 pt-3">
+                <p className="text-xs font-medium uppercase tracking-widest text-muted-foreground">
+                  Bank details — printed on the PO
+                </p>
+              </div>
+              <F label="A/c holder's name">
+                <input
+                  className={inputBase}
+                  value={form.bank_holder}
+                  onChange={(e) => setForm({ ...form, bank_holder: e.target.value })}
+                />
+              </F>
+              <F label="Bank name">
+                <input
+                  className={inputBase}
+                  value={form.bank_name}
+                  onChange={(e) => setForm({ ...form, bank_name: e.target.value })}
+                />
+              </F>
+              <F label="A/c no.">
+                <input
+                  className={inputBase}
+                  value={form.bank_ac_no}
+                  onChange={(e) => setForm({ ...form, bank_ac_no: e.target.value })}
+                />
+              </F>
+              <F label="IFSC">
+                <input
+                  maxLength={11}
+                  className={inputBase}
+                  placeholder="e.g. HDFC0001234"
+                  value={form.bank_ifsc}
+                  onChange={(e) => setForm({ ...form, bank_ifsc: e.target.value })}
+                />
+              </F>
+              <F label="Branch">
+                <input
+                  className={inputBase}
+                  value={form.bank_branch}
+                  onChange={(e) => setForm({ ...form, bank_branch: e.target.value })}
+                />
+              </F>
               <F label="Notes" full>
                 <textarea
                   rows={3}
@@ -578,7 +666,7 @@ function SupplierDetailModal({
   exposure: number;
   onClose: () => void;
 }) {
-  const address = [supplier.address_line, supplier.city, supplier.country, supplier.postal_code]
+  const address = [supplier.address_line, supplier.city, (supplier as any).state_code ?? (supplier as any).stateCode ?? (supplier as any).state_code, supplier.country, supplier.postal_code]
     .filter(Boolean)
     .join(", ");
   return (
@@ -618,6 +706,30 @@ function SupplierDetailModal({
               label="PAN"
               value={(supplier as any).panCardNo ?? supplier.pan_card_no ?? "—"}
             />
+            <div className="col-span-2">
+              <Detail
+                label="Bank details"
+                value={
+                  [
+                    (supplier as any).bankHolder ?? (supplier as any).bank_holder,
+                    (supplier as any).bankName ?? (supplier as any).bank_name,
+                    (supplier as any).bankAcNo ?? (supplier as any).bank_ac_no,
+                    (supplier as any).bankIfsc ?? (supplier as any).bank_ifsc,
+                    (supplier as any).bankBranch ?? (supplier as any).bank_branch,
+                  ].some(Boolean)
+                    ? [
+                        (supplier as any).bankHolder ?? (supplier as any).bank_holder,
+                        (supplier as any).bankName ?? (supplier as any).bank_name,
+                        (supplier as any).bankAcNo ?? (supplier as any).bank_ac_no,
+                        (supplier as any).bankIfsc ?? (supplier as any).bank_ifsc,
+                        (supplier as any).bankBranch ?? (supplier as any).bank_branch,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
+                    : "—"
+                }
+              />
+            </div>
             <Detail label="Contact name" value={supplier.contact_name ?? "—"} />
             <Detail label="Contact email" value={supplier.contact_email ?? "—"} />
             <Detail label="Contact phone" value={supplier.contact_phone ?? "—"} />

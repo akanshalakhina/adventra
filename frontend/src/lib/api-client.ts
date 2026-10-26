@@ -24,9 +24,14 @@ function normalizeCashFlowResponse<T>(value: T): T {
   return value;
 }
 
+// The backend snake_cases every response key; endpoints whose UI was written
+// against the camelCase service shapes convert back with this.
+const camelizeResponse = normalizeCashFlowResponse;
+
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...(options.headers as Record<string, string>),
   };
 
@@ -80,11 +85,38 @@ function toQuery(params?: Record<string, any>): string {
 
 const api = {
   get: <T = any>(path: string) => request<T>(path),
-  post: <T = any>(path: string, body?: any) =>
-    request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined }),
-  put: <T = any>(path: string, body?: any) =>
-    request<T>(path, { method: "PUT", body: body ? JSON.stringify(body) : undefined }),
+  post: <T = any>(path: string, body?: any) => {
+    const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
+    return request<T>(path, { method: "POST", body: isFormData ? body : body ? JSON.stringify(body) : undefined });
+  },
+  put: <T = any>(path: string, body?: any) => {
+    const isFormData = typeof FormData !== "undefined" && body instanceof FormData;
+    return request<T>(path, { method: "PUT", body: isFormData ? body : body ? JSON.stringify(body) : undefined });
+  },
   delete: <T = any>(path: string) => request<T>(path, { method: "DELETE" }),
+
+  // Document Auto-extraction (OCR + AI for Invoices & Proformas)
+  documentExtraction: {
+    extract: async (file: File, scope: "purchase_invoices" | "proformas" = "purchase_invoices") => {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("scope", scope);
+      // `file` stays snake_case (it is a DocMeta); only `extracted` is camelized.
+      const res = await api.post<{
+        success: boolean;
+        file: {
+          path: string;
+          url: string;
+          name: string;
+          size: number;
+          type: string;
+          uploaded_at: string;
+        };
+        extracted: any;
+      }>("/document-extract", formData);
+      return { ...res, extracted: res?.extracted ? camelizeResponse(res.extracted) : res?.extracted };
+    },
+  },
 
   // Auth — the session JWT is held in an httpOnly cookie set by the server;
   // client JS never sees or stores it.
@@ -142,6 +174,15 @@ const api = {
     list: (productId?: string) =>
       api.get<any[]>(`/stock-movements${productId ? `?productId=${productId}` : ""}`),
     create: (data: any) => api.post<any>("/stock-movements", data),
+    manual: (data: {
+      productId: string;
+      quantity: number;
+      direction: "in" | "out";
+      reason: string;
+      notes: string;
+      warehouse?: string;
+      status?: "draft" | "confirmed";
+    }) => api.post<any>("/stock-movements/manual", data),
     bulkCreate: (data: {
       productId: string;
       reason?: string;
@@ -350,8 +391,10 @@ const api = {
   // Goods Sales Orders (catalogue-backed customer orders — never touch stock)
   goodsSalesOrders: {
     list: () => api.get<any[]>("/goods-sales-orders"),
-    nextBuyerOrderNo: () =>
-      api.get<{ buyerOrderNo: string }>("/goods-sales-orders/next-buyer-order-no"),
+    nextBuyerOrderNo: (customerId?: string) =>
+      api.get<{ buyerOrderNo: string }>(
+        `/goods-sales-orders/next-buyer-order-no${customerId ? `?customerId=${encodeURIComponent(customerId)}` : ""}`,
+      ),
     create: (data: any) => api.post<any>("/goods-sales-orders", data),
     update: (id: string, data: any) => api.put<any>(`/goods-sales-orders/${id}`, data),
     delete: (id: string) => api.delete(`/goods-sales-orders/${id}`),
@@ -359,12 +402,47 @@ const api = {
     // Warehouse sign-off (hard gate): approve / hold / reject a confirmed SO.
     warehouseSignoff: (id: string, status: "approved" | "on_hold" | "rejected", notes?: string) =>
       api.post<any>(`/goods-sales-orders/${id}/warehouse-signoff`, { status, notes }),
-    warehouseApprove: (id: string, action: "approve" | "reject", notes?: string) =>
-      api.post<any>(`/goods-sales-orders/${id}/warehouse-approve`, { action, notes }),
+    warehouseApprove: (
+      id: string,
+      action: "approve" | "reject",
+      notes?: string,
+      editedQuantities?: Record<string, number>,
+    ) =>
+      api.post<any>(`/goods-sales-orders/${id}/warehouse-approve`, {
+        action,
+        notes,
+        // Sent as a list: product ids must not be rewritten by the key transform.
+        edited_lines: editedQuantities
+          ? Object.entries(editedQuantities).map(([product_id, quantity]) => ({ product_id, quantity }))
+          : undefined,
+      }),
     salesReview: (id: string, action: "submit" | "approve" | "reject" | "push", notes?: string) =>
       api.post<any>(`/goods-sales-orders/${id}/sales-review`, { action, notes }),
     checkerApprove: (id: string, action: "approve" | "reject") =>
       api.post<any>(`/goods-sales-orders/${id}/checker-approve`, { action }),
+    checkStock: (id: string, locationId?: string) =>
+      api.get<any>(
+        `/goods-sales-orders/${id}/stock-check${locationId ? `?locationId=${encodeURIComponent(locationId)}` : ""}`,
+      ).then((res) => camelizeResponse(res) as {
+        sufficient: boolean;
+        shortLines: Array<{
+          productId: string;
+          name: string;
+          required: number;
+          available: number;
+          onHand: number;
+          reservedByOthers: number;
+        }>;
+        lineChecks: Array<{
+          productId: string;
+          name: string;
+          required: number;
+          available: number;
+          onHand: number;
+          reservedByOthers: number;
+          sufficient: boolean;
+        }>;
+      }),
   },
 
   // Customer document approvals (public, token-authenticated — no login)
@@ -406,6 +484,26 @@ const api = {
       api.post<any>(`/goods-dispatches/${id}/record-ewb`, data),
     sendBack: (id: string, reason: string) =>
       api.post<any>(`/goods-dispatches/${id}/send-back`, { reason }),
+    downloadPackingSlip: async (id: string, filename?: string) => {
+      const res = await fetch(`${API_URL}/goods-dispatches/${id}/packing-slip`, {
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error((err as any).error || "Could not download Packing Slip PDF");
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const disp = res.headers.get("content-disposition") || "";
+      const m = disp.match(/filename="?([^"]+)"?/);
+      a.download = m?.[1] ?? `${filename || "packing-slip"}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    },
   },
 
   // Unified workflow queue (PDF-3) — tasks, per-doc timelines, settings
@@ -567,7 +665,7 @@ const api = {
     // Automatic reminders: on/off master switch + due-date schedule (any admin).
     settings: {
       get: () => api.get<any>("/reminder-settings"),
-      update: (data: { enabled?: boolean; scheduleDays?: number[] }) =>
+      update: (data: { enabled?: boolean; scheduleDays?: number[]; sendToCustomer?: boolean }) =>
         api.put<any>("/reminder-settings", data),
     },
   },
@@ -775,6 +873,76 @@ const api = {
     ) => api.post<any>(`/eway-bills/${id}/extend`, data || {}),
     sync: (id: string) => api.post<any>(`/eway-bills/${id}/sync`, {}),
   },
+
+  // Bank reconciliation: match bank statement entries to invoices (credits →
+  // sales, debits → purchase) by UTR / invoice number / party + amount, then
+  // record the confirmed lines as payments. Responses are camelized back.
+  bankReconciliation: {
+    reconcile: (entries: Array<{
+      id?: string;
+      date?: string;
+      description?: string;
+      amount?: number;
+      type?: "credit" | "debit";
+      reference?: string;
+    }>) =>
+      api
+        .post<any>("/bank-reconciliation/reconcile", { entries })
+        .then((res) => camelizeResponse(res) as {
+          totalEntries: number;
+          matchedCount: number;
+          partialCount: number;
+          unmatchedCount: number;
+          alreadyAppliedCount: number;
+          matches: Array<{
+            entryId: string;
+            entryDate: string;
+            narration: string;
+            entryAmount: number;
+            entryType: "credit" | "debit";
+            matchedInvoiceId: string | null;
+            matchedInvoiceNumber: string | null;
+            matchedInvoiceType: "sales" | "purchase" | null;
+            partyName: string | null;
+            invoiceTotal: number | null;
+            invoiceBalance: number | null;
+            detectedUtr: string | null;
+            matchConfidence: "exact_utr" | "invoice_in_narration" | "amount_party_exact" | "unmatched";
+            amountMatches: boolean;
+            notes: string;
+            applied: boolean;
+          }>;
+        }),
+
+    apply: (matches: Array<{
+      entryId?: string;
+      matchedInvoiceId: string | null;
+      matchedInvoiceType: "sales" | "purchase" | null;
+      entryAmount: number;
+      entryDate?: string;
+      detectedUtr?: string | null;
+      narration?: string;
+    }>) =>
+      api
+        .post<any>("/bank-reconciliation/apply", { matches })
+        .then((res) => camelizeResponse(res) as {
+          success: boolean;
+          appliedCount: number;
+          failedCount: number;
+          results: Array<{
+            entryId: string | null;
+            invoiceId: string;
+            invoiceNumber: string;
+            invoiceType: string;
+            status: "applied" | "failed";
+            invoiceStatus: string | null;
+            amountApplied: number;
+            message: string;
+            error?: string;
+          }>;
+        }),
+  },
 };
 
+export { api };
 export default api;

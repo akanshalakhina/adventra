@@ -1,4 +1,4 @@
-﻿import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import api from "@/lib/api-client";
@@ -21,10 +21,16 @@ import {
   AlertTriangle,
   CheckCircle2,
   ShoppingCart,
+  Sparkles,
 } from "lucide-react";
 import { TableSkeleton } from "@/components/skeletons";
 import { toast } from "sonner";
 import { DocumentUploader, type DocMeta } from "@/components/document-uploader";
+import {
+  InvoiceAutoExtractModal,
+  hasUsefulExtraction,
+  type ExtractedData,
+} from "@/components/invoice-auto-extract-modal";
 import {
   PaymentTermsFields,
   balanceDaysFor,
@@ -96,7 +102,7 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-// â”€â”€â”€ Line draft (snake_case â€” the API transform handles the rest) â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ─── Line draft (snake_case — the API transform handles the rest) ─────────
 type LineDraft = {
   product_id: string;
   sku: string | null;
@@ -248,13 +254,13 @@ function PurchasesPageContent({
     },
   });
 
-  // Goods POs â€” the linked purchase order that supplies the invoice lines.
+  // Goods POs — the linked purchase order that supplies the invoice lines.
   const posQ = useQuery({
     queryKey: ["goods-pos-for-pi"],
     queryFn: async () => api.goodsPurchaseOrders.list(),
   });
 
-  // GRNs â€” created AFTER the invoice; linked back to show received quantities.
+  // GRNs — created AFTER the invoice; linked back to show received quantities.
   const grnsQ = useQuery({
     queryKey: ["goods-receipts-for-pi"],
     queryFn: async () => api.goodsReceipts.list(),
@@ -290,7 +296,7 @@ function PurchasesPageContent({
   });
 
   const piConfig: TxFiltersConfig<any> = {
-    searchPlaceholder: "Search by invoice number, supplier, PO / GRNâ€¦",
+    searchPlaceholder: "Search by invoice number, supplier, PO / GRN…",
     search: (p) => [
       p.invoice_number,
       p.bill_to_contact_person,
@@ -345,7 +351,7 @@ function PurchasesPageContent({
       <PageHeader
         eyebrow="Procurement"
         title="Purchase invoices"
-        description="Invoices you receive from suppliers, linked to the purchase order they bill. A purchase invoice records the supplier payable â€” it never touches stock. Only a confirmed GRN credits inventory."
+        description="Invoices you receive from suppliers, linked to the purchase order they bill. A purchase invoice records the supplier payable — it never touches stock. Only a confirmed GRN credits inventory."
         icon={<ShoppingCart className="h-5 w-5" />}
         actions={
           canCreate ? (
@@ -357,7 +363,7 @@ function PurchasesPageContent({
             </button>
           ) : (
             <span className="inline-flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-[10px] uppercase tracking-widest text-muted-foreground">
-              Read-only Â· {isChecker ? "Checker" : isTreasury ? "Treasury" : "View"}
+              Read-only · {isChecker ? "Checker" : isTreasury ? "Treasury" : "View"}
             </span>
           )
         }
@@ -449,7 +455,7 @@ function PurchasesPageContent({
                                   ) : null}
                                 </div>
                               ) : (
-                                <span className="text-muted-foreground">â€”</span>
+                                <span className="text-muted-foreground">—</span>
                               )}
                             </td>
                             <td className="px-5 py-3">
@@ -467,7 +473,7 @@ function PurchasesPageContent({
                                   )}
                                 </div>
                               ) : (
-                                <span className="text-muted-foreground">â€”</span>
+                                <span className="text-muted-foreground">—</span>
                               )}
                             </td>
                             <td className="px-5 py-3 text-right num">
@@ -482,7 +488,7 @@ function PurchasesPageContent({
                             </td>
                             <td className="px-5 py-3">
                               {links.length === 0 ? (
-                                <span className="text-muted-foreground">â€”</span>
+                                <span className="text-muted-foreground">—</span>
                               ) : (
                                 <div className="space-y-0.5">
                                   {links.map((s: any) => (
@@ -494,7 +500,7 @@ function PurchasesPageContent({
                                       <Link2 className="h-3 w-3" />
                                       {s.invoice_number}
                                       <span className="text-muted-foreground">
-                                        â†’ {s.debtor?.name ?? "?"}
+                                        → {s.debtor?.name ?? "?"}
                                       </span>
                                     </Link>
                                   ))}
@@ -666,8 +672,115 @@ function NewPurchaseModal({
     })),
   );
   const [docs, setDocs] = useState<DocMeta[]>(invoice?.documents ?? []);
+  const [extractModalOpen, setExtractModalOpen] = useState(false);
 
-  // GRN received quantities â€” from the linked GRN (created after this invoice).
+  const handleApplyExtracted = (data: ExtractedData, uploadedFile: DocMeta | null) => {
+    const extractedLines = Array.isArray(data.lines) ? data.lines : [];
+    const lc = (v: unknown) => String(v ?? "").trim().toLowerCase();
+
+    // 1. Supplier — switch only when the document mapped to a known supplier.
+    const matchedVendor = data.matchedSupplierId
+      ? vendors.find((v: any) => v.id === data.matchedSupplierId)
+      : undefined;
+    const supplierId: string = matchedVendor ? matchedVendor.id : form.vendor_id;
+    const supplierChanged = !!matchedVendor && matchedVendor.id !== form.vendor_id;
+
+    // 2. PO auto-match — exact (case-insensitive, trimmed) number, and only
+    // among the billable POs of that supplier (same rule as eligiblePos).
+    let poToPick: POFragment | null = null;
+    const rawPo = lc(data.poNumber);
+    if (rawPo) {
+      const hits = pos.filter(
+        (p) =>
+          ["approved", "sent", "partially_received"].includes(p.status) &&
+          (!supplierId || p.supplier_id === supplierId) &&
+          lc(p.po_number) === rawPo,
+      );
+      poToPick = hits.length === 1 ? hits[0] : null;
+    }
+    // A linked PO from another supplier can't stay once the supplier changes.
+    const currentPo = pos.find((p) => p.id === form.goods_po_id);
+    const clearPo = supplierChanged && !!currentPo && currentPo.supplier_id !== supplierId && !poToPick;
+
+    // Only fields that were actually extracted overwrite the form.
+    setForm((prev) => ({
+      ...prev,
+      vendor_id: supplierId,
+      ...(supplierChanged && matchedVendor ? toTermsFormFields(matchedVendor) : {}),
+      ...(clearPo ? { goods_po_id: "", goods_po_number: "" } : {}),
+      invoice_number: data.documentNumber?.trim() || prev.invoice_number,
+      issue_date: data.documentDate || prev.issue_date,
+      due_date: data.dueDate || prev.due_date,
+      freight: data.freight != null ? String(data.freight) : prev.freight,
+      po_number: data.poNumber?.trim() || prev.po_number,
+    }));
+    if (clearPo) setLines([]);
+
+    // If matching PO is found and not yet selected, pick it to auto-populate PO lines
+    if (poToPick && poToPick.id !== form.goods_po_id) {
+      pickPo(poToPick.id);
+    }
+
+    // If extracted lines are available
+    if (extractedLines.length > 0) {
+      setLines((prevLines) => {
+        if (prevLines.length === 0) {
+          return extractedLines.map((item) => {
+            const matched = !!item.matchedProductId;
+            const qty = Number(item.quantity) || 0;
+            const price = Number(item.unitPrice) || 0;
+            return {
+              product_id: item.matchedProductId || "",
+              sku: matched ? (item.matchedProductSku ?? null) : null,
+              // Keep the printed description unless a catalogue product matched.
+              name: matched && item.matchedProductName ? item.matchedProductName : item.name || "",
+              unit: item.unit || "unit",
+              ordered_qty: qty,
+              grn_received_qty: 0,
+              invoice_qty: qty ? String(qty) : "",
+              unit_price: price ? String(price) : "",
+              po_unit_price: price || null,
+              gst_rate: item.gstRate != null ? String(item.gstRate) : "",
+            };
+          });
+        }
+
+        return prevLines.map((line) => {
+          const match = extractedLines.find((item) => {
+            if (item.matchedProductId && item.matchedProductId === line.product_id) return true;
+            if (item.productCode && line.sku && lc(item.productCode) === lc(line.sku)) return true;
+            if (item.name && line.name && lc(item.name) === lc(line.name)) return true;
+            return false;
+          });
+          if (match) {
+            return {
+              ...line,
+              invoice_qty: Number(match.quantity) ? String(match.quantity) : line.invoice_qty,
+              unit_price: Number(match.unitPrice) ? String(match.unitPrice) : line.unit_price,
+              gst_rate: match.gstRate != null ? String(match.gstRate) : line.gst_rate,
+            };
+          }
+          return line;
+        });
+      });
+    }
+
+    if (uploadedFile) {
+      setDocs((prev) => {
+        const exists = prev.some((d) => d.path === uploadedFile.path || d.name === uploadedFile.name);
+        return exists ? prev : [...prev, uploadedFile];
+      });
+    }
+
+    setExtractModalOpen(false);
+    if (hasUsefulExtraction(data)) {
+      toast.success("Details applied to the invoice — please verify before saving.");
+    } else if (uploadedFile) {
+      toast.info("Document attached. Nothing could be auto-filled.");
+    }
+  };
+
+  // GRN received quantities — from the linked GRN (created after this invoice).
   const linkedGrn = useMemo(() => {
     if (!isEdit || !invoice?.linked_goods_receipt_id) return null;
     return grns.find((g) => g.id === invoice.linked_goods_receipt_id) ?? null;
@@ -714,7 +827,7 @@ function NewPurchaseModal({
 
   const eligiblePos = useMemo(() => {
     // Only POs that can actually be billed (sent / partially received) are
-    // selectable â€” but the invoice's own linked PO is always kept so an
+    // selectable — but the invoice's own linked PO is always kept so an
     // existing invoice remains viewable/editable even after it's fully received.
     const open = pos.filter((p) => ["approved", "sent", "partially_received"].includes(p.status));
     const bySupplier = form.vendor_id ? open.filter((p) => p.supplier_id === form.vendor_id) : open;
@@ -881,7 +994,7 @@ function NewPurchaseModal({
     };
   }, [lines, form.freight]);
 
-  // Quantity vs GRN + price vs PO differences â€” shown clearly (warn-only).
+  // Quantity vs GRN + price vs PO differences — shown clearly (warn-only).
   const differences = useMemo(() => {
     const diffs: Array<{
       name: string;
@@ -934,9 +1047,9 @@ function NewPurchaseModal({
     0,
   );
 
-  // The proforma linked to the PO carries the agreed advance % â€” its advance
-  // (proforma total Ã— %) is deducted even before treasury has funded it.
-  // Whichever is larger (agreed % vs actually paid) is what's deducted â€” this
+  // The proforma linked to the PO carries the agreed advance % — its advance
+  // (proforma total × %) is deducted even before treasury has funded it.
+  // Whichever is larger (agreed % vs actually paid) is what's deducted — this
   // mirrors the backend resolveProformaForInvoice logic.
   const linkedPf = (proformasQ.data ?? []).find(
     (p: any) => p.id === form.linked_supplier_proforma_id,
@@ -950,7 +1063,7 @@ function NewPurchaseModal({
       : 0;
   const advanceToDeduct = round2(Math.max(advancesTotal, pctAdvance));
 
-  // Pick a linked proforma â†’ set the formal link and PO reference.
+  // Pick a linked proforma → set the formal link and PO reference.
   const pickProforma = (id: string) => {
     const pf = (proformasQ.data ?? []).find((p: any) => p.id === id) as any;
     setForm((f) => ({
@@ -987,7 +1100,7 @@ function NewPurchaseModal({
       if (!form.vendor_id) throw new Error("Add a supplier first.");
       if (!form.invoice_number.trim()) throw new Error("Supplier invoice number required");
       if (!form.goods_po_id)
-        throw new Error("Link a purchase order â€” it supplies the invoice lines");
+        throw new Error("Link a purchase order — it supplies the invoice lines");
       if (lines.length === 0)
         throw new Error("Add at least one line from the linked purchase order");
       const payloadLines = lines.map((l) => ({
@@ -1052,7 +1165,7 @@ function NewPurchaseModal({
               {isEdit ? "Edit purchase invoice" : "Record purchase invoice"}
             </h3>
             <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
-              Records the supplier payable â€” it never creates stock. The GRN (created later) credits
+              Records the supplier payable — it never creates stock. The GRN (created later) credits
               inventory.
             </div>
           </div>
@@ -1073,7 +1186,37 @@ function NewPurchaseModal({
             </div>
           )}
 
-          {/* â”€â”€ Header â”€â”€ */}
+          {/* AI / Document Auto-fill Banner (new invoices only) */}
+          {!isEdit && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-primary/30 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent p-3.5 shadow-sm">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/20 text-primary ring-1 ring-primary/30">
+                <Sparkles className="h-5 w-5" />
+              </div>
+              <div>
+                <div className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                  Auto-fill from Supplier Invoice (PDF / Scan)
+                  <span className="rounded-full bg-primary/20 px-1.5 py-0.2 text-[9px] font-normal text-primary">
+                    Smart OCR / Gemini AI
+                  </span>
+                </div>
+                <div className="text-[11px] text-muted-foreground">
+                  Upload supplier tax invoice or bill (PDF or image) to extract invoice #, dates, supplier, PO #, quantities & prices.
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setExtractModalOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-medium text-primary-foreground shadow transition hover:bg-primary/90"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              Auto-fill from Invoice
+            </button>
+          </div>
+          )}
+
+          {/* ── Header ── */}
           <fieldset className="rounded-lg border border-border/60 p-4">
             <legend className="px-1 text-xs font-medium uppercase tracking-widest text-muted-foreground">
               Invoice header
@@ -1085,7 +1228,7 @@ function NewPurchaseModal({
                   onChange={(v) => {
                     const po = pos.find((p) => p.id === form.goods_po_id);
                     if (po && po.supplier_id !== v) {
-                      // The linked PO belongs to a different supplier â€” clear it
+                      // The linked PO belongs to a different supplier — clear it
                       // so invoice lines can't come from the wrong PO.
                       setForm((f) => ({
                         ...f,
@@ -1152,7 +1295,7 @@ function NewPurchaseModal({
             </div>
           </fieldset>
 
-          {/* â”€â”€ Linked PO + lines â”€â”€ */}
+          {/* ── Linked PO + lines ── */}
           <fieldset className="rounded-lg border border-border/60 p-4">
             <legend className="px-1 text-xs font-medium uppercase tracking-widest text-muted-foreground">
               Linked purchase order & item lines
@@ -1161,10 +1304,10 @@ function NewPurchaseModal({
               <SearchableSelect
                 value={form.goods_po_id}
                 onChange={pickPo}
-                placeholder="Select purchase orderâ€¦"
+                placeholder="Select purchase order…"
                 disabled={isEdit && !!invoice?.linked_goods_receipt_id}
                 options={[
-                  { value: "", label: "Select purchase orderâ€¦" },
+                  { value: "", label: "Select purchase order…" },
                   ...eligiblePos.map((p: any) => {
                     const bill = p.bill_to_contact_person ?? p.bill_to_name ?? null;
                     return {
@@ -1197,13 +1340,13 @@ function NewPurchaseModal({
             )}
             {isEdit && invoice?.linked_goods_receipt_number && (
               <div className="mt-2 rounded-md border border-sem-success/30 bg-sem-success/5 p-2 text-xs text-sem-success">
-                Linked GRN {invoice.linked_goods_receipt_number} â€” GRN received quantities are shown
+                Linked GRN {invoice.linked_goods_receipt_number} — GRN received quantities are shown
                 per line below.
               </div>
             )}{" "}
             {lines.length === 0 ? (
               <div className="mt-3 rounded-md border border-sem-attention/40 bg-sem-attention/10 p-3 text-xs text-sem-attention">
-                Select a linked purchase order above â€” its product lines are required and
+                Select a linked purchase order above — its product lines are required and
                 auto-filled here.
               </div>
             ) : (
@@ -1332,19 +1475,19 @@ function NewPurchaseModal({
             )}
           </fieldset>
 
-          {/* â”€â”€ Advance deduction (optional purchase-proforma link) â”€â”€ */}
+          {/* ── Advance deduction (optional purchase-proforma link) ── */}
           <fieldset className="rounded-lg border border-border/60 p-4">
             <legend className="px-1 text-xs font-medium uppercase tracking-widest text-muted-foreground">
               Advance deduction
             </legend>
             <div className="space-y-3">
-              <L label="Linked supplier proforma (optional â€” deducts advances already paid)">
+              <L label="Linked supplier proforma (optional — deducts advances already paid)">
                 <SearchableSelect
                   value={form.linked_supplier_proforma_id}
                   onChange={pickProforma}
-                  placeholder="None â€” manual PO reference"
+                  placeholder="None — manual PO reference"
                   options={[
-                    { value: "", label: "None â€” manual PO reference" },
+                    { value: "", label: "None — manual PO reference" },
                     ...(proformasQ.data ?? []).map((p: any) => ({
                       value: p.id,
                       label: p.proforma_number ?? p.po_number ?? p.id,
@@ -1359,22 +1502,22 @@ function NewPurchaseModal({
                     Proforma {linkedPf.proforma_number ?? linkedPf.po_number ?? ""}
                   </div>
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-muted-foreground">
-                    {linkedPf.proforma_date && <div>Date Â· {fmtDate(linkedPf.proforma_date)}</div>}
-                    <div>Total Â· {fmtMoney(linkedPf.amount)}</div>
+                    {linkedPf.proforma_date && <div>Date · {fmtDate(linkedPf.proforma_date)}</div>}
+                    <div>Total · {fmtMoney(linkedPf.amount)}</div>
                     {pctAdvance > 0 && (
                       <div>
-                        Advance Â· {linkedPf.advance_pct}% ={" "}
+                        Advance · {linkedPf.advance_pct}% ={" "}
                         <span className="font-medium text-primary">{fmtMoney(pctAdvance)}</span>
                       </div>
                     )}
-                    {linkedPf.supplier_contact && <div>Contact Â· {linkedPf.supplier_contact}</div>}
-                    {linkedPf.supplier_gstin && <div>GSTIN Â· {linkedPf.supplier_gstin}</div>}
-                    {linkedPf.payment_terms && <div>Terms Â· {formatPaymentTerms({ paymentTermsType: linkedPf.paymentTermsType ?? linkedPf.payment_terms_type, advancePct: linkedPf.advancePct ?? linkedPf.advance_pct, paymentTerms: linkedPf.payment_terms })}</div>}
+                    {linkedPf.supplier_contact && <div>Contact · {linkedPf.supplier_contact}</div>}
+                    {linkedPf.supplier_gstin && <div>GSTIN · {linkedPf.supplier_gstin}</div>}
+                    {linkedPf.payment_terms && <div>Terms · {formatPaymentTerms({ paymentTermsType: linkedPf.paymentTermsType ?? linkedPf.payment_terms_type, advancePct: linkedPf.advancePct ?? linkedPf.advance_pct, paymentTerms: linkedPf.payment_terms })}</div>}
                     {linkedPf.valid_until && (
-                      <div>Valid until Â· {fmtDate(linkedPf.valid_until)}</div>
+                      <div>Valid until · {fmtDate(linkedPf.valid_until)}</div>
                     )}
                     {linkedPf.expected_delivery_date && (
-                      <div>Expected delivery Â· {fmtDate(linkedPf.expected_delivery_date)}</div>
+                      <div>Expected delivery · {fmtDate(linkedPf.expected_delivery_date)}</div>
                     )}
                   </div>
                 </div>
@@ -1389,7 +1532,7 @@ function NewPurchaseModal({
               </L>
               <p className="text-[10px] text-muted-foreground">
                 Advances already paid to the supplier against the linked proforma are deducted from
-                the invoice total â€” the net amount is what you owe. If no proforma, the full amount
+                the invoice total — the net amount is what you owe. If no proforma, the full amount
                 applies.
               </p>
               {form.po_number.trim() && (
@@ -1398,19 +1541,19 @@ function NewPurchaseModal({
                     Advances paid against {form.po_number}
                   </div>
                   {advLookupQ.isFetching ? (
-                    <div className="text-muted-foreground">Looking upâ€¦</div>
+                    <div className="text-muted-foreground">Looking up…</div>
                   ) : (advLookupQ.data?.advances ?? []).length === 0 ? (
                     <div className="text-muted-foreground">
                       {pctAdvance > 0
-                        ? `No cash advances recorded yet â€” deducting the agreed advance (${linkedPf?.advance_pct}% of the proforma).`
-                        : "No advances recorded for this PO number on the purchase side â€” full amount applies."}
+                        ? `No cash advances recorded yet — deducting the agreed advance (${linkedPf?.advance_pct}% of the proforma).`
+                        : "No advances recorded for this PO number on the purchase side — full amount applies."}
                     </div>
                   ) : (
                     <ul className="space-y-0.5">
                       {((advLookupQ.data?.advances ?? []) as any[]).map((a) => (
                         <li key={a.id} className="flex justify-between">
                           <span className="text-muted-foreground">
-                            {fmtDate(a.advance_date)} {a.reference ? `Â· ${a.reference}` : ""}
+                            {fmtDate(a.advance_date)} {a.reference ? `· ${a.reference}` : ""}
                           </span>
                           <span className="num text-primary">{fmtMoney(a.amount)}</span>
                         </li>
@@ -1426,7 +1569,7 @@ function NewPurchaseModal({
             </div>
           </fieldset>
 
-          {/* â”€â”€ Totals â”€â”€ */}
+          {/* ── Totals ── */}
           <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-1 rounded-lg border border-border/60 bg-muted/20 p-4 text-sm">
               <Row label="Subtotal" value={fmtMoney(totals.subtotal)} />
@@ -1457,7 +1600,7 @@ function NewPurchaseModal({
                       ? `Less advance (${linkedPf?.advance_pct}% of proforma)`
                       : "Less advance paid"}
                   </span>
-                  <span className="num text-destructive">âˆ’{fmtMoney(advanceToDeduct)}</span>
+                  <span className="num text-destructive">−{fmtMoney(advanceToDeduct)}</span>
                 </div>
               )}
               <div className="flex items-center justify-between">
@@ -1491,7 +1634,7 @@ function NewPurchaseModal({
                   className="inp resize-y"
                   value={form.notes}
                   onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                  placeholder="Payment terms, delivery remarksâ€¦"
+                  placeholder="Payment terms, delivery remarks…"
                 />
               </L>
               <DocumentUploader
@@ -1504,7 +1647,7 @@ function NewPurchaseModal({
             </div>
           </div>
 
-          {/* â”€â”€ Difference checks â”€â”€ */}
+          {/* ── Difference checks ── */}
           {differences.length > 0 && (
             <div className="rounded-lg border border-sem-attention/40 bg-sem-attention/5 p-4">
               <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-sem-attention">
@@ -1542,13 +1685,13 @@ function NewPurchaseModal({
                     className="inp resize-y"
                     value={form.difference_notes}
                     onChange={(e) => setForm({ ...form, difference_notes: e.target.value })}
-                    placeholder="e.g. Price negotiated at invoicing; quantity adjusted for partial deliveryâ€¦"
+                    placeholder="e.g. Price negotiated at invoicing; quantity adjusted for partial delivery…"
                   />
                 </L>
               </div>
               {form.difference_notes.trim().length === 0 && (
                 <p className="mt-1 text-[10px] text-muted-foreground">
-                  Not required to save â€” but the checker will see these differences, so an
+                  Not required to save — but the checker will see these differences, so an
                   explanation speeds up approval.
                 </p>
               )}
@@ -1557,14 +1700,14 @@ function NewPurchaseModal({
 
           {isEdit && invoice?.status === "approved_for_payment" && !isAdmin && !isTreasury && (
             <div className="rounded-md border border-primary/30 bg-primary/5 p-3 text-xs text-muted-foreground">
-              This invoice is approved for payment. Only treasury/admin can record payments â€” use
+              This invoice is approved for payment. Only treasury/admin can record payments — use
               the funding queue.
             </div>
           )}
 
           <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
             <p className="text-[10px] text-muted-foreground">
-              Saving never touches inventory â€” the confirmed GRN is the only stock-crediting
+              Saving never touches inventory — the confirmed GRN is the only stock-crediting
               document.
             </p>
             <div className="flex gap-2">
@@ -1585,6 +1728,13 @@ function NewPurchaseModal({
             </div>
           </div>
         </form>
+        <InvoiceAutoExtractModal
+          isOpen={extractModalOpen}
+          onClose={() => setExtractModalOpen(false)}
+          scope="purchase_invoices"
+          suppliers={vendors}
+          onApply={handleApplyExtracted}
+        />
         <style>{`.inp{width:100%;background:var(--color-input);border:1px solid var(--color-border);color:var(--color-foreground);border-radius:6px;padding:.55rem .75rem;font-size:.875rem}.inp:disabled{opacity:.55}.inp:focus{outline:none;border-color:var(--color-primary);box-shadow:0 0 0 3px color-mix(in oklab,var(--color-primary) 25%,transparent)}`}</style>
       </div>
     </div>
@@ -1689,7 +1839,7 @@ function PurchaseDetailModal({
             {invoice.linked_supplier_proforma_number && (
               <D label="Linked proforma" value={invoice.linked_supplier_proforma_number} />
             )}
-            <D label="Linked GRN" value={invoice.linked_goods_receipt_number ?? "â€”"} />
+            <D label="Linked GRN" value={invoice.linked_goods_receipt_number ?? "—"} />
             {invoice.paid_date && <D label="Paid date" value={fmtDate(invoice.paid_date)} />}
             {invoice.po_amount != null && invoice.po_amount > 0 && (
               <D
@@ -1737,12 +1887,12 @@ function PurchaseDetailModal({
                             <div className="mt-0.5 flex gap-1">
                               {qtyDiff && (
                                 <span className="text-[9px] font-medium text-sem-attention">
-                                  qty â‰  GRN
+                                  qty ≠ GRN
                                 </span>
                               )}
                               {priceDiff && (
                                 <span className="text-[9px] font-medium text-sem-attention">
-                                  price â‰  PO
+                                  price ≠ PO
                                 </span>
                               )}
                             </div>
@@ -1779,7 +1929,7 @@ function PurchaseDetailModal({
                 <span className="text-xs uppercase tracking-widest text-muted-foreground">
                   Less advance paid
                 </span>
-                <span className="num text-destructive">âˆ’{fmtMoney(advance)}</span>
+                <span className="num text-destructive">−{fmtMoney(advance)}</span>
               </div>
             )}
             <div className="flex items-center justify-between">
@@ -1815,7 +1965,7 @@ function PurchaseDetailModal({
 
           {grn && (
             <div className="rounded-md border border-sem-success/30 bg-sem-success/5 p-3 text-xs text-sem-success">
-              Linked GRN {grn.receipt_number} Â·{" "}
+              Linked GRN {grn.receipt_number} ·{" "}
               {grn.status === "confirmed" ? "stock credited" : grn.status}
             </div>
           )}

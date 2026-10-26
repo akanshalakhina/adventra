@@ -35,6 +35,8 @@ import {
   termSummary,
 } from "@/components/customer-terms";
 import { SearchableSelect } from "@/components/ui/searchable-select";
+import { StateSelect, CitySelect } from "@/components/state-city-select";
+import { resolveStandardState, stateForCity } from "@/lib/india-city-state";
 import { ProductVariantPicker, fullItemName } from "@/components/product-variant-picker";
 import { QuickAddVariantModal } from "@/components/product-quick-create";
 import {
@@ -105,6 +107,8 @@ type SO = {
   created_at: string;
   customer_id: string | null;
   customer_name: string | null;
+  customer_type?: string | null;
+  customerType?: string | null;
   ship_customer_id?: string | null;
   shipCustomerId?: string | null;
   ship_customer_name?: string | null;
@@ -112,6 +116,10 @@ type SO = {
   contact_person: string | null;
   billing_address: string | null;
   delivery_address: string | null;
+  /** Delivery state (standardized Indian State/UT name via dropdown). */
+  state: string | null;
+  /** Delivery city (dependent on state via dropdown). */
+  city: string | null;
   buyer_order_no: string | null;
   reference_no: string | null;
   delivery_note: string | null;
@@ -187,8 +195,10 @@ type Customer = {
   gstin: string | null;
   pan: string | null;
   city: string | null;
+  state?: string | null;
   country: string | null;
   postal_code: string | null;
+  customerType?: string | null;
 };
 
 function normAddresses(v: any): CustomerAddress[] {
@@ -229,6 +239,43 @@ function addrLabel(a: CustomerAddress, i: number): string {
   const full = fullAddr(a);
   const short = full.length > 60 ? `${full.slice(0, 60)}…` : full;
   return `${a.label ? `${a.label} — ` : ""}${short}`;
+}
+
+/** Canonical state name from any stored value (legacy free-text safe). */
+function canonState(v: any): string {
+  const s = String(v ?? "").trim();
+  if (!s) return "";
+  return resolveStandardState(s) ?? s;
+}
+
+/** Delivery city/state fetched from the customer master (shipping first). */
+function deliveryCityStateOf(c: any): { city: string; state: string } {
+  if (!c) return { city: "", state: "" };
+  const ship = (c.shipping_addresses ?? [])[0] as CustomerAddress | undefined;
+  const bill = (c.billing_addresses ?? [])[0] as CustomerAddress | undefined;
+  const picked = ship ?? bill;
+  const city = String(picked?.city ?? c.city ?? "").trim();
+  const rawState =
+    String(picked?.state ?? "").trim() ||
+    String((c as any).state ?? "").trim() ||
+    String(c.country ?? "").trim();
+  let state = canonState(rawState);
+  if (!state && city) state = stateForCity(city) || "";
+  return { city, state };
+}
+
+/** Billing city/state fetched from the customer master. */
+function billingCityStateOf(c: any): { city: string; state: string } {
+  if (!c) return { city: "", state: "" };
+  const bill = (c.billing_addresses ?? [])[0] as CustomerAddress | undefined;
+  const city = String(bill?.city ?? c.city ?? "").trim();
+  const rawState =
+    String(bill?.state ?? "").trim() ||
+    String((c as any).state ?? "").trim() ||
+    String(c.country ?? "").trim();
+  let state = canonState(rawState);
+  if (!state && city) state = stateForCity(city) || "";
+  return { city, state };
 }
 
 const SO_STATUSES = [
@@ -299,14 +346,65 @@ function resolveTierPrice(
   tier: string,
 ): string | null {
   if (!p) return null;
+  const anyP = p as any;
   switch (tier) {
-    case "mrp": return p.mrp != null ? String(p.mrp) : null;
-    case "ecommerce": return p.ecommerce_price != null ? String(p.ecommerce_price) : null;
-    case "retailer": return p.retailer_price != null ? String(p.retailer_price) : null;
-    case "distributor": return p.distributor_price != null ? String(p.distributor_price) : null;
-    case "flexible": return p.flexible_price != null ? String(p.flexible_price) : null;
+    case "mrp": {
+      const v = p.mrp ?? anyP.mrp;
+      return v != null ? String(v) : null;
+    }
+    case "ecommerce": {
+      const v = p.ecommerce_price ?? anyP.ecommercePrice;
+      return v != null ? String(v) : null;
+    }
+    case "retailer": {
+      const v = p.retailer_price ?? anyP.retailerPrice;
+      return v != null ? String(v) : null;
+    }
+    case "distributor": {
+      const v = p.distributor_price ?? anyP.distributorPrice;
+      return v != null ? String(v) : null;
+    }
+    case "flexible": {
+      const v = p.flexible_price ?? anyP.flexiblePrice;
+      return v != null ? String(v) : null;
+    }
+    case "": {
+      const v = p.unit_price ?? anyP.unitPrice;
+      return v != null ? String(v) : null;
+    }
     default: return null;
   }
+}
+
+export const SO_CUSTOMER_TYPES = [
+  { value: "Retailer", label: "Retailer (Retailer pricing)", tier: "retailer" },
+  { value: "Distributor", label: "Distributor (Distributor pricing)", tier: "distributor" },
+  { value: "Dealer", label: "Dealer (Distributor pricing)", tier: "distributor" },
+  { value: "Defence", label: "Defence (0% Concessional GST)", tier: "" },
+  { value: "Others", label: "Others (Standard pricing)", tier: "" },
+];
+
+function getTierForCustomerType(customerType?: string | null): string {
+  if (!customerType) return "";
+  const s = customerType.toLowerCase().trim();
+  if (s === "retailer") return "retailer";
+  if (s === "distributor" || s === "dealer") return "distributor";
+  return "";
+}
+
+function resolvePriceForCustomerType(
+  p: CatalogueProduct | undefined | null,
+  customerType?: string | null,
+): string {
+  if (!p) return "";
+  const anyP = p as any;
+  const tier = getTierForCustomerType(customerType);
+  if (tier) {
+    const tierPrice = resolveTierPrice(p, tier);
+    if (tierPrice != null && tierPrice !== "") return tierPrice;
+  }
+  const fallback = p.unit_price ?? anyP.unitPrice;
+  return fallback != null ? String(fallback) : "";
 }
 
 export function SalesOrdersPage() {
@@ -387,9 +485,11 @@ export function SalesOrdersPage() {
             gstin: d.gstin ?? null,
             pan: d.panCardNo ?? d.pan_card_no ?? null,
             city: d.city ?? null,
+            state: d.state ?? null,
             country: d.country ?? null,
-            postal_code: d.postal_code ?? null,
-          paymentTermsType: d.paymentTermsType ?? d.payment_terms_type ?? null,
+            postal_code: d.postal_code ?? d.postalCode ?? null,
+            customerType: d.customerType ?? d.customer_type ?? null,
+            paymentTermsType: d.paymentTermsType ?? d.payment_terms_type ?? null,
           advancePct: d.advancePct ?? d.advance_pct ?? null,
           paymentTermsDays: d.paymentTermsDays ?? d.payment_terms_days ?? null,
           paymentTerms: d.paymentTerms ?? d.payment_terms ?? null,
@@ -538,7 +638,16 @@ export function SalesOrdersPage() {
                               </div>
                             </td>
                             <td className="px-5 py-3">
-                              {s.customer_name ?? customerName(s.customer_id) ?? "—"}
+                              <div className="flex items-center gap-2">
+                                <span className="font-medium text-foreground">
+                                  {s.customer_name ?? customerName(s.customer_id) ?? "—"}
+                                </span>
+                                {((s as any).customer_type ?? (s as any).customerType) && (
+                                  <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[9px] font-semibold text-primary">
+                                    {(s as any).customer_type ?? (s as any).customerType}
+                                  </span>
+                                )}
+                              </div>
                               {((s as any).ship_customer_name ?? (s as any).shipCustomerName) &&
                               ((s as any).ship_customer_name ?? (s as any).shipCustomerName) !== (s.customer_name ?? customerName(s.customer_id)) ? (
                                 <div className="text-[10px] text-muted-foreground">
@@ -668,6 +777,7 @@ export function SalesOrdersPage() {
         <SOModal
           userId={user.id}
           so={editing}
+          sos={sosQ.data ?? []}
           products={productsQ.data ?? []}
           customers={customersQ.data ?? []}
           canWrite={canWrite}
@@ -701,9 +811,35 @@ type LineDraft = {
   price_tier: string;
 };
 
+// Per-customer buyer order sequence: a customer's first order is "001", then
+// "002", … Existing trailing-digit formats are honoured (prefix + width of
+// the highest number seen). Cancelled orders don't consume numbers.
+function computeNextBuyerOrderNo(customerId: string, allSos: SO[] = []): string | null {
+  if (!customerId) return null;
+  const mine = (allSos ?? []).filter(
+    (s) => s.customer_id === customerId && (s.status ?? "") !== "cancelled",
+  );
+  let max = 0;
+  let prefix = "";
+  let width = 3;
+  for (const s of mine) {
+    const raw = (s.buyer_order_no ?? "").trim();
+    const match = raw.match(/^(.*?)(\d+)\s*$/);
+    if (!match) continue;
+    const n = parseInt(match[2], 10) || 0;
+    if (n > max) {
+      max = n;
+      prefix = match[1];
+      width = Math.max(3, match[2].length);
+    }
+  }
+  return `${prefix}${String(max + 1).padStart(width, "0")}`;
+}
+
 function SOModal({
   userId,
   so,
+  sos = [],
   products,
   customers,
   canWrite,
@@ -712,6 +848,7 @@ function SOModal({
 }: {
   userId: string;
   so: SO | null;
+  sos?: SO[];
   products: CatalogueProduct[];
   customers: Customer[];
   canWrite: boolean;
@@ -725,9 +862,20 @@ function SOModal({
   // (before anything has been dispatched).
   const editable = !isEdit || status === "draft" || status === "confirmed";
 
+  const stockCheckQ = useQuery({
+    queryKey: ["so_stock_check", so?.id],
+    queryFn: () => (so?.id ? api.goodsSalesOrders.checkStock(so.id) : null),
+    enabled: !!(isEdit && so?.id),
+  });
+
   const [f, setF] = useState({
     order_date: (so?.order_date ?? new Date().toISOString().slice(0, 10)).slice(0, 10),
     customer_id: so?.customer_id ?? "",
+    customer_type:
+      (so as any)?.customerType ??
+      (so as any)?.customer_type ??
+      customers.find((c) => c.id === so?.customer_id)?.customerType ??
+      "",
     ship_customer_id: (so as any)?.ship_customer_id ?? (so as any)?.shipCustomerId ?? "",
     same_as_billing: (() => {
       const ship = (so as any)?.ship_customer_id ?? (so as any)?.shipCustomerId ?? null;
@@ -738,6 +886,8 @@ function SOModal({
     contact_person: so?.contact_person ?? "",
     billing_address: so?.billing_address ?? "",
     delivery_address: so?.delivery_address ?? "",
+    state: ((so as any)?.state ?? "").trim(),
+    city: ((so as any)?.city ?? "").trim(),
     buyer_order_no: so?.buyer_order_no ?? "",
     reference_no: so?.reference_no ?? "",
     delivery_note: so?.delivery_note ?? "",
@@ -755,25 +905,10 @@ function SOModal({
     notes: so?.notes ?? "",
     freight: so?.freight != null ? String(so.freight) : "",
   });
-  // Auto-fill the buyer order number for a new SO from the confirmed-order
-  // sequence (BO-<year>-<n>). Still editable afterwards.
-  useEffect(() => {
-    if (isEdit) return;
-    let cancelled = false;
-    api.goodsSalesOrders
-      .nextBuyerOrderNo()
-      .then((r) => {
-        if (cancelled || !r?.buyerOrderNo) return;
-        setF((prev) => (prev.buyer_order_no ? prev : { ...prev, buyer_order_no: r.buyerOrderNo }));
-      })
-      .catch(() => {
-        /* prefill is best-effort; the field stays manual */
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // The buyer order number runs per customer (first order 001, then 002, …)
+  // and is filled when the billing customer is picked (see
+  // pickBillingCustomer). It stays editable afterwards, and the server
+  // auto-assigns one on save when left blank.
   const [lines, setLines] = useState<LineDraft[]>(
     (so?.lines ?? []).map((l) => ({
       product_id: l.product_id,
@@ -851,8 +986,31 @@ function SOModal({
     const tierPrice = resolveTierPrice(p, tier);
     setLine(i, {
       price_tier: tier,
-      unit_price: tierPrice ?? line.unit_price,
+      unit_price: tierPrice ?? (tier === "" ? (p?.unit_price != null ? String(p.unit_price) : line.unit_price) : line.unit_price),
     });
+  };
+
+  const handleCustomerTypeChange = (newType: string) => {
+    setF((prev) => ({ ...prev, customer_type: newType }));
+    const isDef = newType?.toLowerCase() === "defence";
+    const tier = getTierForCustomerType(newType);
+
+    setLines((prev) =>
+      prev.map((l) => {
+        if (!l.product_id) return l;
+        const p = products.find((x) => x.id === l.product_id);
+        const tierPrice = resolvePriceForCustomerType(p, newType);
+        return {
+          ...l,
+          price_tier: tier,
+          unit_price: tierPrice || l.unit_price,
+          gst_rate: isDef ? "0" : (p?.gst_rate != null ? String(p.gst_rate) : l.gst_rate),
+        };
+      }),
+    );
+    if (newType) {
+      toast.info(`Pricing updated for ${newType} tier`);
+    }
   };
 
   // Live address books, one per side (see loadSoAddrs below). The billing
@@ -865,18 +1023,46 @@ function SOModal({
 
   const pickBillingCustomer = (id: string) => {
     const c = customers.find((x) => x.id === id);
+    const nextBuyerNo = computeNextBuyerOrderNo(id, sos);
+    const custType = c?.customerType ?? f.customer_type ?? "";
+    // Confirm against the server (it sees just-saved drafts the local list
+    // may miss) and prefer its number when it disagrees — unless the user
+    // has since typed a custom value.
+    if (id && !isEdit && nextBuyerNo) {
+      api.goodsSalesOrders
+        .nextBuyerOrderNo(id)
+        .then((r) => {
+          const serverNo = r?.buyerOrderNo?.trim();
+          if (!serverNo || serverNo === nextBuyerNo) return;
+          setF((prev) =>
+            prev.customer_id === id && prev.buyer_order_no === nextBuyerNo
+              ? { ...prev, buyer_order_no: serverNo }
+              : prev,
+          );
+        })
+        .catch(() => {
+          /* local suggestion stands; the server assigns on save anyway */
+        });
+    }
     setBillAddrBook(null);
     setBillAddrFor("");
+    const delivery = deliveryCityStateOf(c);
     setF((prev) => {
       const same = (prev as any).same_as_billing !== false;
       return {
         ...prev,
         customer_id: id,
+        customer_type: custType,
+        buyer_order_no: (!prev.buyer_order_no?.trim() && nextBuyerNo) ? nextBuyerNo : prev.buyer_order_no,
         contact_person: c?.contact_name ?? prev.contact_person,
         billing_address: c?.billing_address ?? prev.billing_address,
         // Buyer tax snapshot for the BILL TO block (editable per order).
         bill_gstin: c?.gstin ?? "",
         bill_pan: c?.pan ?? "",
+        // Delivery city/state fetched from the customer master.
+        ...(delivery.city || delivery.state
+          ? { city: delivery.city || prev.city, state: delivery.state || prev.state }
+          : {}),
         // When shipping follows billing, mirror the billing party across.
         ...(same
           ? {
@@ -897,6 +1083,21 @@ function SOModal({
       };
     });
     if (id) {
+      const isDef = custType?.toLowerCase() === "defence";
+      const tier = getTierForCustomerType(custType);
+      setLines((prev) =>
+        prev.map((l) => {
+          if (!l.product_id) return l;
+          const p = products.find((x) => x.id === l.product_id);
+          const tierPrice = resolvePriceForCustomerType(p, custType);
+          return {
+            ...l,
+            price_tier: tier || l.price_tier,
+            unit_price: tierPrice || l.unit_price,
+            gst_rate: isDef ? "0" : (p?.gst_rate != null ? String(p.gst_rate) : l.gst_rate),
+          };
+        }),
+      );
       if (c && (c.billing_addresses?.length ?? 0) > 1) {
         setBillAddrBook(c.billing_addresses ?? []);
         setBillAddrFor(id);
@@ -916,6 +1117,7 @@ function SOModal({
     const c = customers.find((x) => x.id === id);
     setShipAddrBook(null);
     setShipAddrFor("");
+    const delivery = deliveryCityStateOf(c);
     setF((prev) => ({
       ...prev,
       ship_customer_id: id,
@@ -923,6 +1125,10 @@ function SOModal({
       // Buyer tax snapshot for the SHIP TO block (editable per order).
       ship_gstin: c?.gstin ?? "",
       ship_pan: c?.pan ?? "",
+      // Delivery city/state fetched from the shipping customer master.
+      ...(delivery.city || delivery.state
+        ? { city: delivery.city || prev.city, state: delivery.state || prev.state }
+        : {}),
     }));
     if (id) {
       if (c && (c.shipping_addresses?.length ?? 0) > 1) {
@@ -937,6 +1143,7 @@ function SOModal({
     setF((prev) => {
       if (on) {
         const c = customers.find((x) => x.id === prev.customer_id);
+        const delivery = deliveryCityStateOf(c);
         return {
           ...prev,
           same_as_billing: true,
@@ -945,6 +1152,9 @@ function SOModal({
             c?.shipping_address ?? c?.billing_address ?? prev.delivery_address,
           ship_gstin: c?.gstin ?? (prev as any).bill_gstin ?? prev.ship_gstin,
           ship_pan: c?.pan ?? (prev as any).bill_pan ?? prev.ship_pan,
+          ...(delivery.city || delivery.state
+            ? { city: delivery.city || prev.city, state: delivery.state || prev.state }
+            : {}),
         };
       }
       return { ...prev, same_as_billing: false, ship_customer_id: "" };
@@ -990,10 +1200,20 @@ function SOModal({
           setShipAddrFor(cid);
         }
         if (overwrite && opts[0]) {
+          const first = opts[0] as CustomerAddress;
+          const city = String((first as any).city ?? "").trim();
+          const rawState = String((first as any).state ?? "").trim();
+          const state = canonState(rawState) || (city ? stateForCity(city) || "" : "");
           setF((prev) =>
             (prev as any).ship_customer_id === cid ||
             ((prev as any).same_as_billing !== false && prev.customer_id === cid)
-              ? { ...prev, delivery_address: fullAddr(opts[0]) }
+              ? {
+                  ...prev,
+                  delivery_address: fullAddr(opts[0]),
+                  ...(city || state
+                    ? { city: city || prev.city, state: state || prev.state }
+                    : {}),
+                }
               : prev,
           );
         }
@@ -1042,6 +1262,11 @@ function SOModal({
 
   const pickProduct = (i: number, id: string) => {
     const p = products.find((x) => x.id === id) as any;
+    const currentCust = customers.find((x) => x.id === f.customer_id);
+    const activeType = f.customer_type || currentCust?.customerType || (so as any)?.customerType || "";
+    const isDefence = activeType?.toLowerCase() === "defence";
+    const tier = getTierForCustomerType(activeType);
+    const resolvedPrice = resolvePriceForCustomerType(p, activeType);
     setLine(i, {
       product_id: id,
       name: p ? fullItemName(p) : "",
@@ -1052,9 +1277,9 @@ function SOModal({
       product_code: p?.model || p?.sku || "",
       hsn_code: String(p?.hsn_code ?? p?.hsnCode ?? ""),
       mrp: p?.mrp != null ? String(p.mrp) : "",
-      unit_price: p?.unit_price != null ? String(p.unit_price) : "",
-      gst_rate: p?.gst_rate != null ? String(p.gst_rate) : "",
-      price_tier: "",
+      unit_price: resolvedPrice,
+      gst_rate: isDefence ? "0" : (p?.gst_rate != null ? String(p.gst_rate) : ""),
+      price_tier: tier,
     });
   };
 
@@ -1075,6 +1300,11 @@ function SOModal({
   };
 
   const applyVariantToLine = (i: number, v: any) => {
+    const currentCust = customers.find((x) => x.id === f.customer_id);
+    const activeType = f.customer_type || currentCust?.customerType || (so as any)?.customerType || "";
+    const isDefence = activeType?.toLowerCase() === "defence";
+    const tier = getTierForCustomerType(activeType);
+    const resolvedPrice = resolvePriceForCustomerType(v, activeType);
     setLine(i, {
       product_id: v.id,
       name: fullItemName(v),
@@ -1085,16 +1315,19 @@ function SOModal({
       product_code: v.model || v.sku || "",
       hsn_code: String(v.hsn_code ?? v.hsnCode ?? ""),
       mrp: v.mrp != null ? String(v.mrp) : "",
-      unit_price: v.unit_price != null ? String(v.unit_price) : lines[i]?.unit_price ?? "",
-      gst_rate: v.gst_rate != null ? String(v.gst_rate) : lines[i]?.gst_rate ?? "",
-      price_tier: "",
+      unit_price: resolvedPrice || lines[i]?.unit_price || "",
+      gst_rate: isDefence ? "0" : (v.gst_rate != null ? String(v.gst_rate) : lines[i]?.gst_rate ?? ""),
+      price_tier: tier,
     });
   };
 
   // Expandable per-line notes (secondary detail row, not a main column).
   const [notesOpen, setNotesOpen] = useState<Record<number, boolean>>({});
 
-  const addLine = () =>
+  const addLine = () => {
+    const currentCust = customers.find((x) => x.id === f.customer_id);
+    const activeType = f.customer_type || currentCust?.customerType || (so as any)?.customerType || "";
+    const tier = getTierForCustomerType(activeType);
     setLines((ls) => [
       ...ls,
       {
@@ -1113,9 +1346,10 @@ function SOModal({
         gst_rate: "",
         notes: "",
         dispatched_qty: 0,
-        price_tier: "",
+        price_tier: tier,
       },
     ]);
+  };
 
   const removeLine = (i: number) => {
     const l = lines[i];
@@ -1210,11 +1444,14 @@ function SOModal({
         customer_name: f.customer_id
           ? (customers.find((c) => c.id === f.customer_id)?.name ?? null)
           : null,
+        customerType: f.customer_type || null,
         ship_customer_id: shipId || null,
         ship_customer_name: shipId ? (shipCustomer?.name ?? null) : null,
         contact_person: f.contact_person.trim() || null,
         billing_address: f.billing_address.trim() || null,
         delivery_address: f.delivery_address.trim() || null,
+        state: (f.state ?? "").trim() || null,
+        city: (f.city ?? "").trim() || null,
         buyer_order_no: f.buyer_order_no.trim() || null,
         reference_no: f.reference_no.trim() || null,
         delivery_note: f.delivery_note.trim() || null,
@@ -1248,6 +1485,8 @@ function SOModal({
       !(d.f as any).contact_person?.trim() &&
       !(d.f as any).billing_address?.trim() &&
       !(d.f as any).delivery_address?.trim() &&
+      !(d.f as any).state?.trim() &&
+      !(d.f as any).city?.trim() &&
       !(d.f as any).buyer_order_no?.trim() &&
       !(d.f as any).reference_no?.trim() &&
       !(d.f as any).notes?.trim() &&
@@ -1377,6 +1616,31 @@ function SOModal({
           cashImpact={cashImpact("sales_order", so)}
         />
       )}
+      {isEdit && so && stockCheckQ.data && (
+        <div
+          className={`mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3.5 py-2 text-xs ${
+            stockCheckQ.data.sufficient
+              ? "border-sem-success/40 bg-sem-success/10 text-sem-success"
+              : "border-destructive/40 bg-destructive/10 text-destructive"
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <PackageCheck className="h-4 w-4 shrink-0" />
+            <span className="font-medium">
+              {stockCheckQ.data.sufficient
+                ? "Auto-check stock: Available (All items in stock, reserved on confirmation)"
+                : `Auto-check stock: Insufficient stock on ${stockCheckQ.data.shortLines.length} item(s) (prevents overselling)`}
+            </span>
+          </div>
+          {!stockCheckQ.data.sufficient && (
+            <span className="text-[11px] font-mono">
+              {stockCheckQ.data.shortLines
+                .map((s) => `${s.name}: short by ${s.required - s.available}`)
+                .join("; ")}
+            </span>
+          )}
+        </div>
+      )}
       <DraftResumeBanner
         draft={soDraft}
         label="Unsaved sales order found"
@@ -1426,6 +1690,43 @@ function SOModal({
                   options={customers.map((c) => ({ value: c.id, label: c.name }))}
                 />
               </L>
+              <L label="Customer Type (Price Category)">
+                <select
+                  className={inputBase}
+                  value={f.customer_type}
+                  onChange={(e) => handleCustomerTypeChange(e.target.value)}
+                  disabled={!editable}
+                >
+                  <option value="">Default (Master Selling Price)</option>
+                  <option value="Retailer">Retailer (Fetches Retailer Price)</option>
+                  <option value="Distributor">Distributor (Fetches Distributor Price)</option>
+                  <option value="Dealer">Dealer (Fetches Distributor Price)</option>
+                  <option value="Defence">Defence (0% Concessional GST)</option>
+                  <option value="Others">Others (Standard Selling Price)</option>
+                </select>
+                {(() => {
+                  const cType = f.customer_type;
+                  if (!cType) return null;
+                  const isDef = cType.toLowerCase() === "defence";
+                  const isRet = cType.toLowerCase() === "retailer";
+                  const isDist = cType.toLowerCase() === "distributor" || cType.toLowerCase() === "dealer";
+                  return (
+                    <div className="mt-1 flex items-center gap-1.5 text-[11px]">
+                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                        isDef
+                          ? "bg-sem-success/15 text-sem-success"
+                          : isRet
+                          ? "bg-blue-500/15 text-blue-600 dark:text-blue-400"
+                          : isDist
+                          ? "bg-purple-500/15 text-purple-600 dark:text-purple-400"
+                          : "bg-primary/10 text-primary"
+                      }`}>
+                        {cType} {isDef ? "· 0% Concessional GST" : isRet ? "· Retailer Pricing Active" : isDist ? "· Distributor Pricing Active" : "· Standard GST"}
+                      </span>
+                    </div>
+                  );
+                })()}
+              </L>
               <L label="Shipping customer">
                 <SearchableSelect
                   value={(f as any).same_as_billing !== false ? f.customer_id : ((f as any).ship_customer_id as string)}
@@ -1463,7 +1764,7 @@ function SOModal({
                     <>
                       {editable && opts.length > 1 && (
                         <select
-                          className="inp mb-1"
+                          className={`${selectBase} mb-1`}
                           value={opts.findIndex((a) => fullAddr(a) === f.billing_address) >= 0 ? String(opts.findIndex((a) => fullAddr(a) === f.billing_address)) : "custom"}
                           onChange={(e) => {
                             if (e.target.value === "custom") return;
@@ -1490,14 +1791,14 @@ function SOModal({
                 })()}
                 <div className="mt-1 grid grid-cols-2 gap-1.5">
                   <input
-                    className="inp !py-1.5 !text-xs"
+                    className={`${inputBase} !py-1.5 !text-xs`}
                     value={f.bill_gstin}
                     onChange={(e) => setF({ ...f, bill_gstin: e.target.value })}
                     placeholder="Bill-to GSTIN"
                     disabled={!editable}
                   />
                   <input
-                    className="inp !py-1.5 !text-xs text-center placeholder:text-center"
+                    className={`${inputBase} !py-1.5 !text-xs text-center placeholder:text-center`}
                     value={f.bill_pan}
                     onChange={(e) => setF({ ...f, bill_pan: e.target.value })}
                     placeholder="Bill-to PAN"
@@ -1516,12 +1817,26 @@ function SOModal({
                     <>
                       {editable && opts.length > 1 && (
                         <select
-                          className="inp mb-1"
+                          className={`${selectBase} mb-1`}
                           value={opts.findIndex((a) => fullAddr(a) === f.delivery_address) >= 0 ? String(opts.findIndex((a) => fullAddr(a) === f.delivery_address)) : "custom"}
                           onChange={(e) => {
                             if (e.target.value === "custom") return;
                             const a = opts[Number(e.target.value)];
-                            if (a) setF({ ...f, delivery_address: fullAddr(a) });
+                            if (a) {
+                              const city = String((a as any).city ?? "").trim();
+                              const rawState = String((a as any).state ?? "").trim();
+                              const state = canonState(rawState) || (city ? stateForCity(city) || "" : "");
+                              setF({
+                                ...f,
+                                delivery_address: fullAddr(a),
+                                ...(city || state
+                                  ? {
+                                      city: city || f.city,
+                                      state: state || f.state,
+                                    }
+                                  : {}),
+                              });
+                            }
                           }}
                         >
                           {opts.map((a, i) => (
@@ -1543,20 +1858,44 @@ function SOModal({
                 })()}
                 <div className="mt-1 grid grid-cols-2 gap-1.5">
                   <input
-                    className="inp !py-1.5 !text-xs"
+                    className={`${inputBase} !py-1.5 !text-xs`}
                     value={f.ship_gstin}
                     onChange={(e) => setF({ ...f, ship_gstin: e.target.value })}
                     placeholder="Ship-to GSTIN"
                     disabled={!editable}
                   />
                   <input
-                    className="inp !py-1.5 !text-xs text-center placeholder:text-center"
+                    className={`${inputBase} !py-1.5 !text-xs text-center placeholder:text-center`}
                     value={f.ship_pan}
                     onChange={(e) => setF({ ...f, ship_pan: e.target.value })}
                     placeholder="Ship-to PAN"
                     disabled={!editable}
                   />
                 </div>
+              </L>
+              <L label="State">
+                <StateSelect
+                  value={f.state ?? ""}
+                  onChange={(v) =>
+                    setF((prev) => ({
+                      ...prev,
+                      state: v,
+                      // Never keep a city from the previous state.
+                      city: v === (prev.state ?? "") ? (prev.city ?? "") : "",
+                    }))
+                  }
+                  placeholder="Select state…"
+                  disabled={!editable}
+                />
+              </L>
+              <L label="City">
+                <CitySelect
+                  stateValue={f.state ?? ""}
+                  value={f.city ?? ""}
+                  onChange={(v) => setF({ ...f, city: v })}
+                  placeholder={(f.state ?? "") ? "Select city…" : "Select a state first…"}
+                  disabled={!editable}
+                />
               </L>
               <L label="Salesperson / owner">
                 <input className={inputBase} value={so?.salesperson_name ?? "You"} disabled />
@@ -1662,13 +2001,30 @@ function SOModal({
             </legend>
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <L label="Buyer's order no.">
-                <input
-                  className={inputBase}
-                  value={f.buyer_order_no}
-                  onChange={(e) => setF({ ...f, buyer_order_no: e.target.value })}
-                  placeholder="Customer PO number"
-                  disabled={!editable}
-                />
+                <div className="space-y-1">
+                  <input
+                    className={inputBase}
+                    value={f.buyer_order_no}
+                    onChange={(e) => setF({ ...f, buyer_order_no: e.target.value })}
+                    placeholder="Customer PO number"
+                    disabled={!editable}
+                  />
+                  {(() => {
+                    const suggested = computeNextBuyerOrderNo(f.customer_id, sos);
+                    if (suggested && f.buyer_order_no !== suggested) {
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => setF({ ...f, buyer_order_no: suggested })}
+                          className="inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline"
+                        >
+                          Use next sequence: <span className="font-semibold">{suggested}</span> (this customer's series)
+                        </button>
+                      );
+                    }
+                    return null;
+                  })()}
+                </div>
               </L>
               <L label="Reference no. & date">
                 <input
@@ -1747,6 +2103,77 @@ function SOModal({
                   const snapMrp = l.mrp || (prod?.mrp != null ? String(prod.mrp) : "");
                   const overDispatched =
                     editable && l.dispatched_qty > 0 && Number(l.ordered_qty) < l.dispatched_qty;
+                  // Size selection box: every size SKU in the line's product family.
+                  // Catalogue hierarchies can be parent → variant (2 levels) or
+                  // parent → colour → size SKU (3 levels), so descendants are
+                  // gathered two levels deep — direct children alone miss the
+                  // size SKUs that hang under colour nodes. Picking a size swaps
+                  // the line to the matching size SKU (same colour kept when
+                  // possible), so a size is always selectable per line.
+                  const upOf = (node: any): any =>
+                    node?.parent_id
+                      ? (products.find((x) => x.id === node.parent_id) ?? null)
+                      : null;
+                  let familyRoot: any = prod ?? null;
+                  {
+                    const up1 = upOf(familyRoot);
+                    if (up1) {
+                      familyRoot = up1;
+                      const up2 = upOf(familyRoot);
+                      if (up2) familyRoot = up2;
+                    }
+                  }
+                  const childrenOf = (id: string): any[] =>
+                    products.filter((x) => (x as any).parent_id === id) as any[];
+                  let descendants: any[] = [];
+                  if (familyRoot) {
+                    const level1 = childrenOf(familyRoot.id);
+                    descendants = [...level1];
+                    for (const c of level1) descendants.push(...childrenOf((c as any).id));
+                  }
+                  const sizedDescendants = descendants.filter(
+                    (k: any) => String(k?.size ?? "").trim() !== "",
+                  );
+                  const sizePool =
+                    sizedDescendants.length > 0
+                      ? sizedDescendants
+                      : prod?.size != null && String(prod.size).trim()
+                        ? [prod]
+                        : [];
+                  const sizeOrder = (a: string, b: string) =>
+                    a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+                  const lineSizeOptions = Array.from(
+                    new Set(
+                      sizePool
+                        .map((k: any) => String(k?.size ?? "").trim())
+                        .filter((s: string) => s !== ""),
+                    ),
+                  ).sort(sizeOrder);
+                  const lineSizeValue =
+                    (l.size ?? "").trim() ||
+                    (lineSizeOptions.includes(snapSize) ? snapSize : "");
+                  const sizeSelectOptions =
+                    lineSizeValue && !lineSizeOptions.includes(lineSizeValue)
+                      ? [lineSizeValue, ...lineSizeOptions]
+                      : lineSizeOptions;
+                  const changeLineSize = (next: string) => {
+                    const size = next.trim();
+                    if (!size) {
+                      setLine(i, { size: "" });
+                      return;
+                    }
+                    const poolMatch =
+                      sizePool.find(
+                        (k: any) =>
+                          String(k?.size ?? "").trim() === size &&
+                          (!l.color.trim() ||
+                            String(k?.color ?? "").trim().toLowerCase() ===
+                              l.color.trim().toLowerCase()),
+                      ) ??
+                      sizePool.find((k: any) => String(k?.size ?? "").trim() === size);
+                    if (poolMatch && poolMatch.id !== l.product_id) pickProduct(i, poolMatch.id);
+                    else setLine(i, { size });
+                  };
                   return (
                     <div key={i} className="space-y-4 rounded-lg border border-border/60 bg-card/30 p-4 sm:p-5">
                       <div className="min-w-0">
@@ -1758,6 +2185,7 @@ function SOModal({
                               placeholder="Select item…"
                               childPlaceholder="Select colour / size…"
                               categoryPlaceholder="Select category…"
+                              categoryCompact
                               layout="stacked"
                             />
                           {(snapColor || snapSize || snapCode || snapHsn || snapMrp) && (
@@ -1787,15 +2215,15 @@ function SOModal({
                               disabled={!editable}
                             />
                         </div>
-                        <div>
-                          <span className="mb-1.5 block text-xs font-medium uppercase tracking-[0.06em] text-muted-foreground">
-                            Ordered qty
-                          </span>
-                          <input
+<div>
+                            <span className="mb-1.5 block text-xs font-medium uppercase tracking-[0.06em] text-muted-foreground">
+                              Ordered qty
+                            </span>
+                            <input
                               type="number"
                               min="1"
                               step="0.001"
-                              className={`inp ${overDispatched ? "!border-sem-attention" : ""}`}
+                              className={overDispatched ? `${inputBase} !border-sem-attention` : inputBase}
                               value={l.ordered_qty}
                               onChange={(e) => setLine(i, { ordered_qty: e.target.value })}
                               disabled={!editable}
@@ -1805,6 +2233,30 @@ function SOModal({
                               Cannot go below dispatched ({l.dispatched_qty})
                             </div>
                           )}
+                        </div>
+                        <div>
+                          <span className="mb-1.5 block text-xs font-medium uppercase tracking-[0.06em] text-muted-foreground">
+                            Size
+                          </span>
+                          <select
+                            className={selectBase}
+                            value={lineSizeValue}
+                            onChange={(e) => changeLineSize(e.target.value)}
+                            disabled={!editable || sizeSelectOptions.length === 0}
+                          >
+                            <option value="">
+                              {!l.product_id
+                                ? "Select item first…"
+                                : sizeSelectOptions.length === 0
+                                  ? "No sizes"
+                                  : "Select size…"}
+                            </option>
+                            {sizeSelectOptions.map((s) => (
+                              <option key={s} value={s}>
+                                {s}
+                              </option>
+                            ))}
+                          </select>
                         </div>
                         <div>
                           {l.product_id ? (
@@ -1877,7 +2329,7 @@ function SOModal({
                           <span className="mb-1.5 block text-xs font-medium uppercase tracking-[0.06em] text-muted-foreground">
                             Line total
                           </span>
-                          <div className="inp text-right font-mono tabular-nums">
+                          <div className={`${inputBase} bg-muted/40 text-right font-mono tabular-nums`}>
                               {fmtMoney(lineTotal)}
                             </div>
                         </div>
@@ -1909,7 +2361,7 @@ function SOModal({
                       {editable && (
                         <L label="Line notes">
                           <input
-                            className="inp !py-1.5 text-xs"
+                            className={`${inputBase} !py-1.5 text-xs`}
                             value={l.notes}
                             onChange={(e) => setLine(i, { notes: e.target.value })}
                             placeholder="Optional line note…"
@@ -1952,7 +2404,7 @@ function SOModal({
                 type="number"
                 min="0"
                 step="0.01"
-                className="inp !w-40 !py-1 text-right"
+                className={`${inputBase} !w-40 !py-1 text-right`}
                 value={f.freight}
                 onChange={(e) => setF({ ...f, freight: e.target.value })}
                 disabled={!editable}

@@ -660,12 +660,33 @@ export function DispatchesPageContent({
                               />
                             </td>
                             <td className="px-5 py-3 text-right">
-                              <button
-                                onClick={() => setView(d)}
-                                className="rounded-md border border-border px-2 py-1 text-[10px] hover:border-primary hover:text-primary"
-                              >
-                                View
-                              </button>
+                              <div className="flex items-center justify-end gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={async () => {
+                                    try {
+                                      toast.info("Generating Packing Slip PDF...");
+                                      await api.goodsDispatches.downloadPackingSlip(
+                                        d.id,
+                                        `packing-slip-${d.dispatch_number || d.id}`,
+                                      );
+                                      toast.success("Packing slip downloaded");
+                                    } catch (err: any) {
+                                      toast.error(err?.message || "Failed to download packing slip");
+                                    }
+                                  }}
+                                  title="Download auto-generated Packing Slip PDF"
+                                  className="rounded-md border border-border px-2 py-1 text-[10px] hover:border-primary hover:text-primary"
+                                >
+                                  Slip PDF
+                                </button>
+                                <button
+                                  onClick={() => setView(d)}
+                                  className="rounded-md border border-border px-2 py-1 text-[10px] hover:border-primary hover:text-primary"
+                                >
+                                  View
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -1166,14 +1187,19 @@ function DispatchCreateModal({
 
       const sourceId = createFromInvoice ? invoiceId : soId;
       if (!sourceId) throw new Error(createFromInvoice ? "Select an invoice to dispatch against" : "Select a sales order to dispatch against");
-      // IRN gate (sale dispatches): goods move only against an invoice with
-      // IRN uploaded — mirror of the server check, for an instant message.
+      // IRN & Finance approval gate (sale dispatches): goods move only against a
+      // Finance-approved invoice with IRN recorded — mirror of the server check.
       const saleTypes = ["customer_sale", "marketplace_sale", "pos_sale"];
       if (saleTypes.includes(String(f.dispatch_type || "customer_sale"))) {
         if (createFromInvoice) {
+          if (selectedInvoice && String(selectedInvoice.status ?? "").toLowerCase() === "pending") {
+            throw new Error(
+              `Invoice ${selectedInvoice?.invoice_number ?? ""} is awaiting Finance approval — dispatch requires a Finance-approved invoice`,
+            );
+          }
           if (!selectedInvoice?.irn) {
             throw new Error(
-              `Invoice ${selectedInvoice?.invoice_number ?? ""} has no IRN uploaded — upload the IRN before dispatching`,
+              `Invoice ${selectedInvoice?.invoice_number ?? ""} has no IRN recorded — IRN is required before warehouse dispatch`,
             );
           }
         } else {
@@ -1184,12 +1210,17 @@ function DispatchCreateModal({
           ) as any;
           if (!soInv) {
             throw new Error(
-              `Create the sales invoice for ${so?.so_number ?? ""} first — dispatch needs an invoice with IRN uploaded`,
+              `Create the sales invoice for ${so?.so_number ?? ""} first — dispatch proceeds only against a Finance-approved invoice with IRN`,
+            );
+          }
+          if (String(soInv.status ?? "").toLowerCase() === "pending") {
+            throw new Error(
+              `Invoice ${soInv.invoice_number ?? ""} is awaiting Finance approval — dispatch requires a Finance-approved invoice`,
             );
           }
           if (!soInv.irn) {
             throw new Error(
-              `Invoice ${soInv.invoice_number ?? ""} has no IRN uploaded — upload the IRN before dispatching`,
+              `Invoice ${soInv.invoice_number ?? ""} has no IRN recorded — IRN is required before warehouse dispatch`,
             );
           }
         }
@@ -2169,6 +2200,24 @@ function DispatchDetailModal({
               >
                 <Printer className="h-3.5 w-3.5" /> Print delivery challan
               </Link>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    toast.info("Generating Packing Slip PDF...");
+                    await api.goodsDispatches.downloadPackingSlip(
+                      d.id,
+                      `packing-slip-${d.dispatch_number || d.id}`,
+                    );
+                    toast.success("Packing slip downloaded");
+                  } catch (err: any) {
+                    toast.error(err?.message || "Failed to download packing slip");
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:border-primary hover:text-primary"
+              >
+                <FileText className="h-3.5 w-3.5" /> Packing slip PDF
+              </button>
               {canWrite &&
                 ["draft", "details_submitted", "ready_for_dispatch", "confirmed", "partially_delivered", "delivered"].includes(d.status) && (
                   <button

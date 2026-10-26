@@ -1,4 +1,4 @@
-// ===========================================================================
+﻿// ===========================================================================
 // Reports module registry — the single source of truth that drives both the
 // Reports Dashboard (categories + cards) and the shared report detail layout
 // (filters, columns, pagination and exports).
@@ -59,6 +59,8 @@ export interface ReportFilterDef {
   statuses?: Array<{ value: string; label: string }>;
   /** Show the buyer (debtor) dropdown. */
   buyer?: boolean;
+  /** Show the days-bucket dropdown (aging report: Current / 1–30 / …). */
+  buckets?: Array<{ value: string; label: string }>;
   /** Show the Bulk Pay / Treasury Pay checkboxes (payment_type filter). */
   paymentTypes?: boolean;
   /** Show the free-text search box. */
@@ -376,6 +378,14 @@ export const REPORTS: ReportDef[] = [
         { value: "pending", label: "Pending" },
       ],
       buyer: true,
+      buckets: [
+        { value: "current", label: "Current (not due)" },
+        { value: "d1_30", label: "1–30 days" },
+        { value: "d31_60", label: "31–60 days" },
+        { value: "d61_90", label: "61–90 days" },
+        { value: "d91_120", label: "91–120 days" },
+        { value: "d120", label: "120+ days" },
+      ],
       search: true,
       searchPlaceholder: "Buyer name…",
       dateRange: true,
@@ -682,3 +692,4 @@ export const STATUS_LABEL_OVERRIDES: Record<string, string> = {
   not_sent: "Not sent",
   ...SIDE_LABELS,
 };
+

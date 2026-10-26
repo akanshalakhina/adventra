@@ -2963,19 +2963,25 @@ export function goodsPOToPdfData(
     .map(([k]) => k)
     .slice(0, 8);
 
+  const textOf = (v: unknown): string => (v === null || v === undefined ? "" : String(v).trim());
   const lines: GoodsPOPdfLine[] = ((po.lines ?? []) as any[]).map((l: any, i: number) => {
     const quantity = Number(l.orderedQty ?? l.ordered_qty ?? 0) || 0;
     const unitPrice = Number(l.unitPrice ?? l.unit_price ?? 0) || 0;
     const gstRate = l.gstRate ?? l.gst_rate ?? null;
     const gst = Number(gstRate) || 0;
+    // Item code: first non-blank of sku / productCode / itemCode (camel or
+    // snake). `??` alone keeps "" and hides the fallback, so use `||`.
+    const productCode =
+      textOf(l.sku) || textOf(l.productCode) || textOf(l.product_code) ||
+      textOf((l as any).itemCode) || textOf((l as any).item_code) || "";
     return {
       sno: i + 1,
-      productCode: l.sku ?? l.productCode ?? l.product_code ?? "",
-      description: l.name || "Item",
-      fabric: l.fabric ?? "",
-      hsn: l.hsnCode ?? l.hsn_code ?? "",
+      productCode,
+      description: textOf(l.name) || "Item",
+      fabric: textOf(l.fabric),
+      hsn: textOf(l.hsnCode) || textOf(l.hsn_code),
       size: sizeOf(l),
-      color: l.color ?? l.colour ?? "",
+      color: textOf(l.color) || textOf(l.colour),
       quantity,
       unitPrice,
       gstRate,
@@ -3051,7 +3057,10 @@ export function goodsPOToPdfData(
     totalQty: Number(po.totalQty ?? po.total_qty ?? lines.reduce((x, l) => x + l.quantity, 0)) || 0,
     grandTotal,
     amountWords: amountInWordsINR(grandTotal),
-    remarks: po.notes ?? "",
+    // Print remarks exactly as the user entered them in the form: every line
+    // break (Enter) becomes a new line in the PDF. Normalize Windows/Mac line
+    // endings first so all of them render identically.
+    remarks: String(po.notes ?? "").replace(/\r\n?/g, "\n"),
     bank,
     bankRaw: opts?.bankRaw ?? null,
     declaration,
@@ -3116,7 +3125,7 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
       };
 
       // ── Title ────────────────────────────────────────────────────────────
-      cell(M, y, CW, 16, "Purchase Order", { font: FB, size: 11, align: "center" });
+      cell(M, y, CW, 16, "Purchase Order", { font: FB, size: 11, align: "left" });
       y += 16;
 
       // ── Header grid: detail | label | value ──────────────────────────────
@@ -3168,15 +3177,18 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
         const ch = r.c ? Math.ceil(wrapH(r.c, VCW, 7.5) + 5) : 11;
         const h = Math.max(11, ah, bh, ch);
         need(h);
-        cell(M, y, AW, h, r.a, { font: r.aFont, size: 7.5 });
-        cell(M + AW, y, BW, h, r.b, { size: 6.5, align: "center" });
-        cell(M + AW + BW, y, VCW, h, r.c, { size: 7.5, align: "center" });
+        cell(M, y, AW, h, r.a, { font: r.aFont, size: 7.5, align: "left" });
+        cell(M + AW, y, BW, h, r.b, { size: 6.5, align: "left" });
+        cell(M + AW + BW, y, VCW, h, r.c, { size: 7.5, align: "left" });
         y += h;
       }
 
       // ── Item table ───────────────────────────────────────────────────────
       const SZW = 30;
-      const C = { sl: 24, code: 46, fabric: 52, hsn: 50, color: 52, unit: 42, ppgst: 56, qty: 42, amt: 62 };
+      // Product codes (e.g. AD-UNI-10-EH100-BEIGE) are long: keep this column
+      // wide so codes wrap in 2 lines instead of 3-4 and never overflow the
+      // row rect (overflow text spills onto ghost pages and strands rows).
+      const C = { sl: 24, code: 78, fabric: 52, hsn: 50, color: 56, unit: 42, ppgst: 56, qty: 42, amt: 62 };
       const fixedW = C.sl + C.code + C.fabric + C.hsn + C.color + C.unit + C.ppgst + C.qty + C.amt;
       const descW = Math.max(60, CW - fixedW - data.sizes.length * SZW);
       const colX = (key: string): number => {
@@ -3210,39 +3222,50 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
           ["qty", "Total\nQuantity"], ["amt", "Amount"],
         ];
         for (const [k, t] of heads) {
-          cell(colX(k), y, colW(k), HEAD_H, t, { font: FB, size: 6.5, align: "center", fill: TALLY.headGray });
+          cell(colX(k), y, colW(k), HEAD_H, t, { font: FB, size: 6.5, align: "left", fill: TALLY.headGray });
         }
         y += HEAD_H;
       };
 
       drawTableHead();
       data.lines.forEach((l, idx) => {
-        const rowH = Math.max(14, Math.ceil(wrapH(l.description, descW, 7) + 6));
+        // Row height must fit EVERY wrapping column — measuring only the
+        // description underestimates rows with long product codes (they wrap
+        // to 2+ lines in the narrow code column), so the text overflows the
+        // rect and spills onto near-blank ghost pages. Code renders at 6.5pt.
+        const rowH = Math.max(
+          14,
+          Math.ceil(wrapH(l.productCode, colW("code"), 6.5, F) + 6),
+          Math.ceil(wrapH(l.description, descW, 7) + 6),
+          Math.ceil(wrapH(l.fabric, colW("fabric"), 7) + 6),
+          Math.ceil(wrapH(l.hsn, colW("hsn"), 7) + 6),
+          Math.ceil(wrapH(l.color, colW("color"), 7) + 6),
+        );
         if (y + rowH > BOT) {
           doc.addPage();
           y = M;
           drawTableHead();
         }
         const fill = idx % 2 === 1 ? TALLY.altRow : TALLY.white;
-        const cells: Array<[string, string, "left" | "center" | "right"]> = [
-          ["sl", String(l.sno), "center"],
-          ["code", l.productCode, "center"],
+        const cells: Array<[string, string, "left", number?]> = [
+          ["sl", String(l.sno), "left"],
+          ["code", l.productCode, "left", 6.5],
           ["desc", l.description, "left"],
-          ["fabric", l.fabric, "center"],
-          ["hsn", l.hsn, "center"],
-          ...data.sizes.map((s): [string, string, "left" | "center" | "right"] => [
+          ["fabric", l.fabric, "left"],
+          ["hsn", l.hsn, "left"],
+          ...data.sizes.map((s): [string, string, "left", number?] => [
             `sz${data.sizes.indexOf(s)}`,
             tallyNum(l.size === s ? l.quantity : 0),
-            "center",
+            "left",
           ]),
-          ["color", l.color, "center"],
-          ["unit", tallyNum(l.unitPrice), "right"],
-          ["ppgst", tallyNum(l.ppInclGst), "right"],
-          ["qty", tallyNum(l.quantity), "right"],
-          ["amt", tallyNum(l.amount), "right"],
+          ["color", l.color, "left"],
+          ["unit", tallyNum(l.unitPrice), "left"],
+          ["ppgst", tallyNum(l.ppInclGst), "left"],
+          ["qty", tallyNum(l.quantity), "left"],
+          ["amt", tallyNum(l.amount), "left"],
         ];
-        for (const [k, t, a] of cells) {
-          cell(colX(k), y, colW(k), rowH, t, { size: 7, align: a, fill });
+        for (const [k, t, a, sz] of cells) {
+          cell(colX(k), y, colW(k), rowH, t, { size: sz ?? 7, align: a, fill });
         }
         y += rowH;
       });
@@ -3250,18 +3273,56 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
       // Reserve the whole tail (totals → amount-in-words → remarks/bank →
       // declaration → sign-off) as ONE unit. Without this, a page break inside
       // the sign-off strands it on a near-empty trailing page.
+      // Greedy word-wrap into lines (splits overlong words by character so a
+      // single unbroken token can never overflow the column). Splits on the
+      // user's own line breaks FIRST, so remarks print exactly as entered —
+      // every Enter in the form becomes a new line in the PDF.
+      const wrapLines = (text: string, w: number, size: number, font?: string): string[] => {
+        doc.font(font ?? F).fontSize(size);
+        const maxW = Math.max(1, w - PAD * 2);
+        const out: string[] = [];
+        for (const para of text.split(/\r?\n/)) {
+          if (!para.trim()) { out.push(""); continue; }
+          let cur = "";
+          const flush = () => { out.push(cur); cur = ""; };
+          for (const wd of para.split(/\s+/)) {
+            if (doc.widthOfString(wd) > maxW) {
+              if (cur) flush();
+              let chunk = "";
+              for (const ch of wd) {
+                if (doc.widthOfString(chunk + ch) > maxW && chunk) { out.push(chunk); chunk = ch; }
+                else chunk += ch;
+              }
+              cur = chunk;
+              continue;
+            }
+            const trial = cur ? `${cur} ${wd}` : wd;
+            if (doc.widthOfString(trial) > maxW && cur) { flush(); cur = wd; }
+            else cur = trial;
+          }
+          flush();
+        }
+        return out;
+      };
+      // Explicit per-line height for the remarks block (same grid the
+      // overflow path below uses), so the reserved height and the drawn
+      // lines always agree — remarks can never overlap the next block.
+      const remLineH = (w: number, size: number): number => {
+        doc.font(F).fontSize(size);
+        return Math.max(9, Math.ceil(doc.heightOfString("Ag", { width: Math.max(1, w - PAD * 2) })));
+      };
       const tailWordsW = Math.round(CW * 0.8);
       const tailWordsH = Math.max(24, Math.ceil(wrapH(data.amountWords, tailWordsW, 7) + 18));
       const tailBankW = Math.round(CW * 0.45);
       const tailRemW = CW - tailBankW;
-      const tailRemarkText = data.remarks ? `Remarks:\n${data.remarks}` : "";
+      const tailRemarkLines = data.remarks ? wrapLines(`Remarks:\n${data.remarks}`, tailRemW, 7) : [];
       const tailBankLineCount = data.bank ? 4 : 0;
       const tailBankInfoH = data.bank
         ? 12 + tailBankLineCount * 11
         : data.bankRaw
           ? Math.max(30, Math.ceil(wrapH(data.bankRaw, tailBankW, 7) + 18))
           : 14;
-      const tailRbH = Math.max(22, Math.ceil(wrapH(tailRemarkText, tailRemW, 7) + 8), tailBankInfoH + 2);
+      const tailRbH = Math.max(22, tailRemarkLines.length ? tailRemarkLines.length * remLineH(tailRemW, 7) + 4 : 0, tailBankInfoH + 2);
       const tailDeclText = (data.declaration ?? []).join("\n");
       const tailDeclH = tailDeclText
         ? Math.max(20, Math.ceil(wrapH(`Declaration\n${tailDeclText}`, CW, 7) + 8))
@@ -3283,9 +3344,9 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
       const TOT_H = 14;
       tailNeed(TOT_H);
       const spanW = CW - colW("qty") - colW("amt");
-      cell(M, y, spanW, TOT_H, "Total (inclusive of Taxes)", { font: FB, size: 7.5, align: "center", fill: TALLY.headGray });
-      cell(M + spanW, y, colW("qty"), TOT_H, tallyNum(data.totalQty), { font: FB, size: 7.5, align: "right", fill: TALLY.headGray });
-      cell(M + spanW + colW("qty"), y, colW("amt"), TOT_H, tallyNum(data.grandTotal), { font: FB, size: 7.5, align: "right", fill: TALLY.headGray });
+      cell(M, y, spanW, TOT_H, "Total (inclusive of Taxes)", { font: FB, size: 7.5, align: "left", fill: TALLY.headGray });
+      cell(M + spanW, y, colW("qty"), TOT_H, tallyNum(data.totalQty), { font: FB, size: 7.5, align: "left", fill: TALLY.headGray });
+      cell(M + spanW + colW("qty"), y, colW("amt"), TOT_H, tallyNum(data.grandTotal), { font: FB, size: 7.5, align: "left", fill: TALLY.headGray });
       y += TOT_H;
 
       // ── Amount in words + E&OE ───────────────────────────────────────────
@@ -3295,47 +3356,133 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
       cell(M, y, wordsW, wordsH, "", {});
       doc.font(FB).fontSize(7).fillColor(TALLY.ink).text("Amount Chargeable (in words)", M + PAD, y + 2, { width: wordsW - PAD * 2 });
       doc.font(F).fontSize(7).fillColor(TALLY.ink).text(data.amountWords, M + PAD, y + 12, { width: wordsW - PAD * 2 });
-      cell(M + wordsW, y, CW - wordsW, wordsH, "E. & O.E", { font: FB, size: 7, align: "center" });
+      cell(M + wordsW, y, CW - wordsW, wordsH, "E. & O.E", { font: FB, size: 7, align: "left" });
       y += wordsH;
 
       // ── Remarks (left) + Bank details (right) ────────────────────────────
+      // Remarks can be arbitrarily long: when the text fits one page it sits
+      // side-by-side with the bank block (structure unchanged); when it is
+      // taller than a whole page it flows full-width across pages so no text
+      // is ever cut off.
       const bankW = Math.round(CW * 0.45);
       const remW = CW - bankW;
-      const remarkText = data.remarks ? `Remarks:\n${data.remarks}` : "";
+      // One wrapped line per user line break — measured and drawn with the
+      // same grid, so the PDF mirrors the form exactly.
+      const remarkLines = data.remarks ? wrapLines(`Remarks:\n${data.remarks}`, remW, 7) : [];
       const bankLineCount = data.bank ? 4 : 0;
       const bankInfoH = data.bank
         ? 12 + bankLineCount * 11
         : data.bankRaw
           ? Math.max(30, Math.ceil(wrapH(data.bankRaw, bankW, 7) + 18))
           : 14;
-      const rbH = Math.max(22, Math.ceil(wrapH(remarkText, remW, 7) + 8), bankInfoH + 2);
-      tailNeed(rbH);
-      const ry0 = y;
-      cell(M, y, remW, rbH, "", {});
-      if (remarkText) {
-        doc.font(F).fontSize(7).fillColor(TALLY.ink).text(remarkText, M + PAD, y + 2, { width: remW - PAD * 2 });
-      }
-      cell(M + remW, y, bankW, rbH, "", {});
-      let by = y;
-      cell(M + remW, by, bankW, 12, "Company's Bank Details", { font: FB, size: 7, align: "center" });
-      by += 12;
-      if (data.bank) {
-        const rows: Array<[string, string]> = [
-          ["A/c Holder's Name:", data.bank.holder],
-          ["Bank Name:", data.bank.bank],
-          ["A/c No.:", data.bank.acNo],
-          ["Branch & IFSC Code:", [data.bank.branch, data.bank.ifsc].filter(Boolean).join(" & ")],
-        ];
-        for (const [k, v] of rows) {
-          const klw = Math.round(bankW * 0.36);
-          cell(M + remW, by, klw, 11, k, { font: FB, size: 6.5, align: "center" });
-          cell(M + remW + klw, by, bankW - klw, 11, v, { size: 7, align: "center" });
-          by += 11;
+      const rbH = Math.max(22, remarkLines.length ? remarkLines.length * remLineH(remW, 7) + 4 : 0, bankInfoH + 2);
+      const pageUsable = BOT - M;
+      // Full-width bordered block that flows across as many pages as needed.
+      // Borders are stroked per page segment so every page looks finished.
+      const flowBlock = (x: number, w: number, textLines: string[], size: number, firstBold: boolean) => {
+        doc.font(F).fontSize(size);
+        const lineH = Math.max(9, Math.ceil(doc.heightOfString("Ag", { width: Math.max(1, w - PAD * 2) })));
+        if (y + lineH + 4 > BOT) { doc.addPage(); y = M; }
+        let segTop = y;
+        let lineIdx = 0;
+        for (const ln of textLines) {
+          if (y + lineH + 2 > BOT) {
+            doc.rect(x, segTop, w, y - segTop).strokeColor(TALLY.ink).lineWidth(0.5).stroke();
+            doc.addPage();
+            y = M;
+            segTop = y;
+          }
+          if (ln) {
+            doc
+              .font(lineIdx === 0 && firstBold ? FB : F)
+              .fontSize(size)
+              .fillColor(TALLY.ink)
+              .text(ln, x + PAD, y + 2, { width: Math.max(1, w - PAD * 2), align: "left" });
+          }
+          lineIdx++;
+          y += lineH;
         }
-      } else if (data.bankRaw) {
-        doc.font(F).fontSize(7).fillColor(TALLY.ink).text(data.bankRaw, M + remW + PAD, by + 2, { width: bankW - PAD * 2 });
+        if (y - segTop < 10) y = segTop + 10;
+        doc.rect(x, segTop, w, y - segTop).strokeColor(TALLY.ink).lineWidth(0.5).stroke();
+      };
+      const drawBankBlock = (x: number, w: number, yy: number) => {
+        let by = yy;
+        cell(x, by, w, 12, "Company's Bank Details", { font: FB, size: 7, align: "left" });
+        by += 12;
+        if (data.bank) {
+          const rows: Array<[string, string]> = [
+            ["A/c Holder's Name:", data.bank.holder],
+            ["Bank Name:", data.bank.bank],
+            ["A/c No.:", data.bank.acNo],
+            ["Branch & IFSC Code:", [data.bank.branch, data.bank.ifsc].filter(Boolean).join(" & ")],
+          ];
+          for (const [k, v] of rows) {
+            const klw = Math.round(w * 0.36);
+            cell(x, by, klw, 11, k, { font: FB, size: 6.5, align: "left" });
+            cell(x + klw, by, w - klw, 11, v, { size: 7, align: "left" });
+            by += 11;
+          }
+        } else if (data.bankRaw) {
+          const bh = Math.max(18, Math.ceil(wrapH(data.bankRaw, w, 7) + 8));
+          cell(x, by, w, bh, "", {});
+          doc.font(F).fontSize(7).fillColor(TALLY.ink).text(data.bankRaw, x + PAD, by + 2, { width: w - PAD * 2, align: "left" });
+          by += bh;
+        }
+        return by;
+      };
+      if (rbH > pageUsable) {
+        // Overflow path: remarks flow full-width across pages, bank follows.
+        tailNeed(20);
+        flowBlock(M, CW, data.remarks ? wrapLines(`Remarks:\n${data.remarks}`, CW, 7) : ["Remarks:"], 7, true);
+        tailNeed(bankInfoH + 14);
+        if (y + bankInfoH + 14 > BOT) { doc.addPage(); y = M; }
+        const bankTop = y;
+        const bankBottom = drawBankBlock(M, CW, y);
+        doc.rect(M, bankTop, CW, bankBottom - bankTop).strokeColor(TALLY.ink).lineWidth(0.5).stroke();
+        y = bankBottom;
+      } else {
+        tailNeed(rbH);
+        const ry0 = y;
+        cell(M, y, remW, rbH, "", {});
+        // Drawn line by line (never as one collapsed blob), so every line
+        // break the user entered in the form appears in the PDF as its own
+        // line. Blank lines keep their vertical space.
+        if (remarkLines.length) {
+          const lh = remLineH(remW, 7);
+          let ry = y + 2;
+          remarkLines.forEach((ln, li) => {
+            if (ln) {
+              doc
+                .font(li === 0 ? FB : F)
+                .fontSize(7)
+                .fillColor(TALLY.ink)
+                .text(ln, M + PAD, ry, { width: Math.max(1, remW - PAD * 2), align: "left" });
+            }
+            ry += lh;
+          });
+        }
+        cell(M + remW, y, bankW, rbH, "", {});
+        let by = y;
+        cell(M + remW, by, bankW, 12, "Company's Bank Details", { font: FB, size: 7, align: "left" });
+        by += 12;
+        if (data.bank) {
+          const rows: Array<[string, string]> = [
+            ["A/c Holder's Name:", data.bank.holder],
+            ["Bank Name:", data.bank.bank],
+            ["A/c No.:", data.bank.acNo],
+            ["Branch & IFSC Code:", [data.bank.branch, data.bank.ifsc].filter(Boolean).join(" & ")],
+          ];
+          for (const [k, v] of rows) {
+            const klw = Math.round(bankW * 0.36);
+            cell(M + remW, by, klw, 11, k, { font: FB, size: 6.5, align: "left" });
+            cell(M + remW + klw, by, bankW - klw, 11, v, { size: 7, align: "left" });
+            by += 11;
+          }
+        } else if (data.bankRaw) {
+          doc.font(F).fontSize(7).fillColor(TALLY.ink).text(data.bankRaw, M + remW + PAD, by + 2, { width: bankW - PAD * 2, align: "left" });
+        }
+        y = ry0 + rbH;
       }
-      y = ry0 + rbH;
 
       // ── Declaration ──────────────────────────────────────────────────────
       const declText = (data.declaration ?? []).join("\n");
@@ -3354,7 +3501,7 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
       tailNeed(tailSignH);
       const signRow = (text: string, o?: { font?: string; size?: number; h?: number }) => {
         const h = o?.h ?? 13;
-        cell(M, y, CW, h, text, { font: o?.font ?? F, size: o?.size ?? 7.5, align: "center" });
+        cell(M, y, CW, h, text, { font: o?.font ?? F, size: o?.size ?? 7.5, align: "left" });
         y += h;
       };
       if (data.signatoryName) signRow(data.signatoryName, { font: FB, h: 14 });
@@ -3364,6 +3511,338 @@ export function buildGoodsPOTallyPdf(data: GoodsPOPdfData): Promise<Buffer> {
       doc.end();
     } catch (e) {
       reject(e);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PACKING SLIP PDF GENERATOR
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface PackingSlipLine {
+  itemNo: number;
+  sku: string | null;
+  name: string;
+  color?: string | null;
+  size?: string | null;
+  quantity: number;
+  unit: string;
+  boxNo?: string | number | null;
+  notes?: string | null;
+}
+
+export interface PackingSlipPdfData {
+  dispatchNumber: string;
+  dispatchDate: string;
+  soNumber?: string | null;
+  invoiceNumber?: string | null;
+  customerName?: string | null;
+  contactPerson?: string | null;
+  deliveryAddress?: string | null;
+  deliveryCity?: string | null;
+  deliveryState?: string | null;
+  deliveryPincode?: string | null;
+  billingAddress?: string | null;
+  warehouse?: string | null;
+  transporterName?: string | null;
+  transportMode?: string | null;
+  vehicleNumber?: string | null;
+  lrNumber?: string | null;
+  cartonCount?: number | null;
+  packageType?: string | null;
+  grossWeight?: number | null;
+  grossWeightUnit?: string | null;
+  handlingInstructions?: string | null;
+  notes?: string | null;
+  lines: PackingSlipLine[];
+  companyName: string;
+  companyAddress?: string | null;
+  companyContact?: string | null;
+  companyGstin?: string | null;
+}
+
+export function dispatchToPackingSlipData(
+  dispatch: any,
+  company: { name: string; address?: string | null; contact?: string | null; gstin?: string | null },
+): PackingSlipPdfData {
+  const lines: PackingSlipLine[] = (dispatch.lines ?? []).map((l: any, idx: number) => ({
+    itemNo: idx + 1,
+    sku: l.sku || null,
+    name: l.name || "Item",
+    color: l.color || null,
+    size: l.size != null ? String(l.size) : null,
+    quantity: Number(l.dispatchedQty ?? l.dispatched_qty ?? l.orderedQty ?? 0),
+    unit: l.unit || "unit",
+    boxNo: l.boxNo ?? l.box_no ?? null,
+    notes: l.notes || null,
+  }));
+
+  return {
+    dispatchNumber: dispatch.dispatchNumber ?? dispatch.dispatch_number ?? "DISP",
+    dispatchDate: dispatch.dispatchDate ?? dispatch.dispatch_date ?? new Date().toISOString().slice(0, 10),
+    soNumber: dispatch.soNumber ?? dispatch.so_number ?? null,
+    invoiceNumber: dispatch.finalInvoiceNumber ?? dispatch.final_invoice_number ?? null,
+    customerName: dispatch.customerName ?? dispatch.customer_name ?? null,
+    contactPerson: dispatch.contactPerson ?? dispatch.contact_person ?? null,
+    deliveryAddress: dispatch.deliveryAddress ?? dispatch.delivery_address ?? null,
+    deliveryCity: dispatch.deliveryCity ?? dispatch.delivery_city ?? null,
+    deliveryState: dispatch.deliveryState ?? dispatch.delivery_state ?? null,
+    deliveryPincode: dispatch.deliveryPincode ?? dispatch.delivery_pincode ?? null,
+    billingAddress: dispatch.billingAddress ?? dispatch.billing_address ?? null,
+    warehouse: dispatch.warehouse ?? null,
+    transporterName: dispatch.transporterName ?? dispatch.transporter_name ?? null,
+    transportMode: dispatch.transportMode ?? dispatch.transport_mode ?? null,
+    vehicleNumber: dispatch.vehicleNumber ?? dispatch.vehicle_number ?? null,
+    lrNumber: dispatch.lrNumber ?? dispatch.lr_number ?? null,
+    cartonCount: dispatch.cartonCount ?? dispatch.carton_count ?? null,
+    packageType: dispatch.packageType ?? dispatch.package_type ?? null,
+    grossWeight: dispatch.grossWeight ?? dispatch.gross_weight ?? null,
+    grossWeightUnit: dispatch.grossWeightUnit ?? dispatch.gross_weight_unit ?? "kg",
+    handlingInstructions: dispatch.handlingInstructions ?? dispatch.handling_instructions ?? null,
+    notes: dispatch.notes ?? null,
+    lines,
+    companyName: company.name || "Adventra",
+    companyAddress: company.address || null,
+    companyContact: company.contact || null,
+    companyGstin: company.gstin || null,
+  };
+}
+
+export function buildPackingSlipPdf(data: PackingSlipPdfData): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    try {
+      const margin = 36;
+      const doc = new PDFDocument({
+        size: "A4",
+        margin,
+        bufferPages: true,
+        info: {
+          Title: `Packing Slip - ${data.dispatchNumber}`,
+          Author: data.companyName,
+          Subject: `Packing List for Dispatch ${data.dispatchNumber}`,
+        },
+      });
+
+      const chunks: Buffer[] = [];
+      doc.on("data", (c: Buffer) => chunks.push(c));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+
+      const contentWidth = 595.28 - margin * 2; // ~523.28
+      let y = margin;
+
+      // 1. Header Band (Dark Slate)
+      const bandHeight = 72;
+      doc.save();
+      doc.rect(margin, y, contentWidth, bandHeight).fill("#1e293b");
+
+      // Company Info (Left)
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(14)
+        .fillColor("#ffffff")
+        .text(data.companyName || "Adventra Platform", margin + 14, y + 14, { width: contentWidth * 0.55 });
+
+      const subLines: string[] = [];
+      if (data.companyAddress) subLines.push(data.companyAddress);
+      if (data.companyGstin) subLines.push(`GSTIN: ${data.companyGstin}`);
+      if (data.companyContact) subLines.push(`Contact: ${data.companyContact}`);
+
+      if (subLines.length > 0) {
+        doc
+          .font("Helvetica")
+          .fontSize(7.5)
+          .fillColor("#cbd5e1")
+          .text(subLines.slice(0, 2).join(" · "), margin + 14, y + 34, { width: contentWidth * 0.55 });
+      }
+
+      // Title & Document Info (Right)
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(16)
+        .fillColor("#38bdf8")
+        .text("PACKING SLIP", margin, y + 14, { width: contentWidth - 14, align: "right" });
+
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(9)
+        .fillColor("#ffffff")
+        .text(`Dispatch #: ${data.dispatchNumber}`, margin, y + 36, { width: contentWidth - 14, align: "right" });
+
+      doc
+        .font("Helvetica")
+        .fontSize(8)
+        .fillColor("#94a3b8")
+        .text(`Date: ${fmtDate(data.dispatchDate)}`, margin, y + 49, { width: contentWidth - 14, align: "right" });
+
+      doc.restore();
+      y += bandHeight + 12;
+
+      // 2. Metadata Columns (Ship-To Left, Dispatch/Transport Right)
+      const colW = (contentWidth - 12) / 2;
+      const boxH = 92;
+
+      // Left Box: Consignee / Ship-To
+      doc.save();
+      doc.rect(margin, y, colW, boxH).fillAndStroke("#f8fafc", "#e2e8f0");
+      doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#0f172a").text("SHIP TO / CONSIGNEE", margin + 10, y + 8);
+
+      let custY = y + 22;
+      doc.font("Helvetica-Bold").fontSize(8).fillColor("#1e293b").text(data.customerName || "Customer", margin + 10, custY, { width: colW - 20 });
+      custY += 12;
+      if (data.contactPerson) {
+        doc.font("Helvetica").fontSize(7.5).fillColor("#64748b").text(`Attn: ${data.contactPerson}`, margin + 10, custY, { width: colW - 20 });
+        custY += 10;
+      }
+      const addr = [data.deliveryAddress, data.deliveryCity, data.deliveryState, data.deliveryPincode].filter(Boolean).join(", ");
+      doc.font("Helvetica").fontSize(7.5).fillColor("#475569").text(addr || "—", margin + 10, custY, { width: colW - 20, height: 40 });
+      doc.restore();
+
+      // Right Box: Dispatch & Transport Info
+      doc.save();
+      doc.rect(margin + colW + 12, y, colW, boxH).fillAndStroke("#f8fafc", "#e2e8f0");
+      doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#0f172a").text("DISPATCH & CARRIER DETAILS", margin + colW + 22, y + 8);
+
+      let dtY = y + 22;
+      const dtCol1 = margin + colW + 22;
+      const dtCol2 = dtCol1 + 95;
+      const dRow = (k: string, v: string | null | undefined) => {
+        doc.font("Helvetica").fontSize(7.5).fillColor("#64748b").text(k, dtCol1, dtY, { width: 90 });
+        doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#1e293b").text(v || "—", dtCol2, dtY, { width: colW - 120 });
+        dtY += 11;
+      };
+
+      dRow("Sales Order Ref:", data.soNumber);
+      dRow("Invoice Ref:", data.invoiceNumber);
+      dRow("Carrier / Mode:", [data.transporterName, data.transportMode].filter(Boolean).join(" · ") || null);
+      dRow("Vehicle / LR No:", [data.vehicleNumber, data.lrNumber ? `LR: ${data.lrNumber}` : ""].filter(Boolean).join(" · ") || null);
+      dRow("Total Packages:", `${data.cartonCount ?? 1} ${data.packageType || "Cartons"}`);
+      dRow("Gross Weight:", data.grossWeight ? `${data.grossWeight} ${data.grossWeightUnit || "kg"}` : null);
+      doc.restore();
+
+      y += boxH + 14;
+
+      // 3. Line Items Table Header
+      const thH = 20;
+      doc.rect(margin, y, contentWidth, thH).fill("#334155");
+
+      const cols = {
+        itemNo: { x: margin + 6, w: 24, align: "left" as const },
+        sku: { x: margin + 32, w: 90, align: "left" as const },
+        desc: { x: margin + 125, w: 220, align: "left" as const },
+        box: { x: margin + 350, w: 45, align: "center" as const },
+        qty: { x: margin + 400, w: 60, align: "right" as const },
+        unit: { x: margin + 465, w: 45, align: "left" as const },
+      };
+
+      doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#ffffff");
+      doc.text("#", cols.itemNo.x, y + 6, { width: cols.itemNo.w, align: cols.itemNo.align });
+      doc.text("SKU", cols.sku.x, y + 6, { width: cols.sku.w, align: cols.sku.align });
+      doc.text("ITEM DESCRIPTION", cols.desc.x, y + 6, { width: cols.desc.w, align: cols.desc.align });
+      doc.text("BOX #", cols.box.x, y + 6, { width: cols.box.w, align: cols.box.align });
+      doc.text("QTY PACKED", cols.qty.x, y + 6, { width: cols.qty.w, align: cols.qty.align });
+      doc.text("UNIT", cols.unit.x, y + 6, { width: cols.unit.w, align: cols.unit.align });
+
+      y += thH;
+
+      // 4. Line Items Table Rows
+      let totalQty = 0;
+      data.lines.forEach((l, idx) => {
+        totalQty += l.quantity;
+        const rowH = (l.color || l.size) ? 24 : 18;
+
+        if (y + rowH > 750) {
+          doc.addPage();
+          y = margin;
+        }
+
+        if (idx % 2 === 1) {
+          doc.rect(margin, y, contentWidth, rowH).fill("#f8fafc");
+        }
+
+        doc.rect(margin, y, contentWidth, rowH).stroke("#f1f5f9");
+
+        doc.font("Helvetica").fontSize(7.5).fillColor("#64748b");
+        doc.text(String(l.itemNo), cols.itemNo.x, y + 5, { width: cols.itemNo.w, align: cols.itemNo.align });
+
+        doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#1e293b");
+        doc.text(l.sku || "—", cols.sku.x, y + 5, { width: cols.sku.w, align: cols.sku.align });
+
+        // Name + Variant
+        doc.font("Helvetica").fontSize(7.5).fillColor("#0f172a");
+        doc.text(l.name, cols.desc.x, y + 5, { width: cols.desc.w, lineBreak: false });
+        if (l.color || l.size) {
+          const varText = [l.color, l.size].filter(Boolean).join(" · ");
+          doc.font("Helvetica").fontSize(6.5).fillColor("#64748b");
+          doc.text(`Variant: ${varText}`, cols.desc.x, y + 13, { width: cols.desc.w });
+        }
+
+        doc.font("Helvetica").fontSize(7.5).fillColor("#475569");
+        doc.text(l.boxNo ? String(l.boxNo) : "1", cols.box.x, y + 5, { width: cols.box.w, align: cols.box.align });
+
+        doc.font("Helvetica-Bold").fontSize(8).fillColor("#0f172a");
+        doc.text(l.quantity.toLocaleString("en-IN"), cols.qty.x, y + 5, { width: cols.qty.w, align: cols.qty.align });
+
+        doc.font("Helvetica").fontSize(7.5).fillColor("#64748b");
+        doc.text(l.unit, cols.unit.x, y + 5, { width: cols.unit.w, align: cols.unit.align });
+
+        y += rowH;
+      });
+
+      // 5. Total Row
+      const totH = 22;
+      doc.rect(margin, y, contentWidth, totH).fill("#f1f5f9");
+      doc.rect(margin, y, contentWidth, totH).stroke("#cbd5e1");
+
+      doc.font("Helvetica-Bold").fontSize(8).fillColor("#0f172a");
+      doc.text("TOTAL ITEMS DISPATCHED:", margin + 12, y + 7);
+
+      doc.font("Helvetica-Bold").fontSize(9).fillColor("#0284c7");
+      doc.text(totalQty.toLocaleString("en-IN"), cols.qty.x, y + 6, { width: cols.qty.w, align: cols.qty.align });
+
+      doc.font("Helvetica-Bold").fontSize(8).fillColor("#0f172a");
+      doc.text(data.lines[0]?.unit || "units", cols.unit.x, y + 7, { width: cols.unit.w, align: cols.unit.align });
+
+      y += totH + 16;
+
+      // 6. Notes & Handling Instructions
+      if (data.handlingInstructions || data.notes) {
+        doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#475569").text("HANDLING INSTRUCTIONS & NOTES:", margin, y);
+        y += 11;
+        const noteText = [data.handlingInstructions, data.notes].filter(Boolean).join(" · ");
+        doc.font("Helvetica").fontSize(7.5).fillColor("#334155").text(noteText, margin, y, { width: contentWidth });
+        y += 20;
+      }
+
+      // 7. Signature / Sign-off Boxes
+      const sigY = Math.max(y + 10, 710);
+      const sigW = (contentWidth - 24) / 2;
+
+      // Left: Warehouse Sign-off
+      doc.rect(margin, sigY, sigW, 60).stroke("#cbd5e1");
+      doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#0f172a").text("PACKED & VERIFIED BY (WAREHOUSE)", margin + 8, sigY + 8);
+      doc.font("Helvetica").fontSize(7).fillColor("#94a3b8").text("Signature & Date: _______________________", margin + 8, sigY + 44);
+
+      // Right: Carrier / Consignee Receipt
+      doc.rect(margin + sigW + 24, sigY, sigW, 60).stroke("#cbd5e1");
+      doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#0f172a").text("RECEIVED IN GOOD CONDITION (CARRIER / CONSIGNEE)", margin + sigW + 32, sigY + 8);
+      doc.font("Helvetica").fontSize(7).fillColor("#94a3b8").text("Signature & Date: _______________________", margin + sigW + 32, sigY + 44);
+
+      // Footer
+      doc
+        .font("Helvetica")
+        .fontSize(6.5)
+        .fillColor("#94a3b8")
+        .text(
+          `Generated automatically by Adventra Platform · Official Packing List for ${data.dispatchNumber}`,
+          margin,
+          785,
+          { width: contentWidth, align: "center" },
+        );
+
+      doc.end();
+    } catch (err) {
+      reject(err);
     }
   });
 }
